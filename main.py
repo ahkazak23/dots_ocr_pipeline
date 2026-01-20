@@ -460,7 +460,7 @@ class TransformersBackend:
                 warnings_list.append(f"runaway_pattern_detected: {pattern.pattern}")
                 self.logger.warning(f"Runaway pattern detected: {pattern.pattern}")
 
-        parsed_json, parse_warnings = parse_model_output(output_text)
+        parsed_json, parse_warnings = parse_model_output(output_text, self.logger)
         warnings_list.extend(parse_warnings)
 
         return InferResult(
@@ -572,7 +572,7 @@ class PipelineBackend:
                     self.logger.warning(f"Runaway pattern detected: {pattern.pattern}")
 
             # Parse JSON
-            parsed_json, parse_warnings = parse_model_output(output_text)
+            parsed_json, parse_warnings = parse_model_output(output_text, self.logger)
             warnings_list.extend(parse_warnings)
 
             return InferResult(
@@ -604,7 +604,7 @@ class PipelineBackend:
 # JSON Parsing & Fallback Chain
 # ----------------------------
 
-def parse_model_output(raw_text: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """Parse model output to JSON with hardening. Returns (parsed_dict, warnings_list)."""
     warnings = []
 
@@ -628,6 +628,12 @@ def parse_model_output(raw_text: str) -> Tuple[Optional[Dict[str, Any]], List[st
             pass
 
     warnings.append("json_parse_failed")
+
+    # Log the raw output for debugging (first 500 chars)
+    if logger:
+        preview = raw_text[:500] if len(raw_text) > 500 else raw_text
+        logger.debug(f"Failed to parse JSON. Raw output preview: {preview}")
+
     return None, warnings
 
 

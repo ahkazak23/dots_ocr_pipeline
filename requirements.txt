@@ -11,5 +11,5 @@ tokenizers>=0.20.3
 accelerate>=1.12.0
 qwen-vl-utils
 av>=13.1.0
-flash-attn==2.8.0.post2
-accelerate
+# flash-attn==2.8.0.post2  # Optional - code auto-detects if installed. Install manually if needed:
+#                          # pip install flash-attn --no-build-isolation
