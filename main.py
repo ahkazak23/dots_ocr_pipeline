@@ -143,7 +143,7 @@ class Config:
     out_dir: str = "./out_json/dots_ocr"
     eval_out_dir: str = "./evaluation_output"
     prompt_mode: str = "layout_all_en"
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 24000  # Official recommendation for layout extraction
     fallback_enabled: bool = True
     save_rendered_images: bool = False
     save_bbox_overlay: bool = True
@@ -208,7 +208,6 @@ class TransformersBackend:
 
             # Download to local directory with underscore name
             from pathlib import Path
-            import os
 
             local_model_dir = Path.home() / ".cache" / "dots_ocr_renamed"
             local_model_dir.mkdir(parents=True, exist_ok=True)
@@ -244,17 +243,16 @@ class TransformersBackend:
             gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
 
         # Dtype selection with T4 workaround
-        # T4 (SM75) has mixed precision issues - force float32 to avoid dtype mismatch
+        # T4 (SM75) does not support bf16 well - switch to fp16
         if torch.cuda.is_available() and gpu_major < 8 and self.cfg.dtype == "bfloat16":
-            self.logger.warning("GPU is SM75 (T4). Forcing dtype=float32 to avoid mixed precision conflicts.")
-            self.logger.warning("This will be slower but stable. For speed, use an Ampere+ GPU (A100, RTX 30xx+).")
-            torch_dtype = torch.float32
+            self.logger.warning("GPU < SM80 (e.g., T4). Switching dtype bfloat16 -> float16.")
+            torch_dtype = torch.float16
         else:
             torch_dtype = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
-                "auto": "auto"
+                "auto": "auto",
             }.get(self.cfg.dtype, torch.float32)
 
         self.logger.info(f"Using dtype: {torch_dtype}")
@@ -330,6 +328,20 @@ class TransformersBackend:
 
         self.logger.info("Model loaded successfully.")
 
+    def _cast_floating_inputs_to_model_dtype(self, inputs):
+        """Cast floating-point tensors in inputs to match model's dtype.
+
+        Prevents dtype mismatch errors like:
+        'Input type (c10::BFloat16) and bias type (c10::Half) should be the same'
+        """
+        import torch
+        model_dtype = next(self._model.parameters()).dtype
+        for k in list(inputs.keys()):
+            v = inputs[k]
+            if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != model_dtype:
+                inputs[k] = v.to(dtype=model_dtype)
+        return inputs
+
     def infer_page(self, image: Image.Image, prompt_mode: str, max_new_tokens: int) -> InferResult:
         import torch
         from qwen_vl_utils import process_vision_info
@@ -351,6 +363,9 @@ class TransformersBackend:
             text=[text], images=image_inputs, videos=video_inputs,
             padding=True, return_tensors="pt",
         ).to(self._model.device)
+
+        # Cast floating inputs to model's dtype
+        inputs = self._cast_floating_inputs_to_model_dtype(inputs)
 
         with torch.inference_mode():
             try:
@@ -1132,8 +1147,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Prompt mode (default: layout_all_en)"
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=4096,
-        help="Maximum new tokens to generate (default: 4096). Use 12000-24000 for pages with large tables."
+        "--max-new-tokens", type=int, default=24000,
+        help="Maximum new tokens to generate (default: 24000, official recommendation for layout extraction)"
     )
     parser.add_argument(
         "--disable-fallback", action="store_true",
