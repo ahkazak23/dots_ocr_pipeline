@@ -207,17 +207,20 @@ class TransformersBackend:
             "float32": torch.float32
         }.get(self.cfg.dtype, torch.float32)
 
-        # T4 does NOT support bf16 well; force fp16 on older CUDA cards
-        if torch.cuda.is_available() and torch_dtype == torch.bfloat16:
-            major, minor = torch.cuda.get_device_capability(0)
-            if major < 8:  # bf16 is Ampere+ (SM80+)
+        # Detect GPU capabilities for optimal settings
+        gpu_major, gpu_minor = None, None
+        if torch.cuda.is_available():
+            gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
+
+            # T4 does NOT support bf16 well; force fp16 on older CUDA cards
+            if torch_dtype == torch.bfloat16 and gpu_major < 8:  # bf16 is Ampere+ (SM80+)
                 self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16.")
                 torch_dtype = torch.float16
 
         # GPU memory check
         if torch.cuda.is_available():
             gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            self.logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB)")
+            self.logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB) - Compute Capability: SM{gpu_major}{gpu_minor}")
 
             if gpu_mem_gb < 8:
                 self.logger.error(
@@ -245,10 +248,27 @@ class TransformersBackend:
             load_kwargs["revision"] = self.cfg.revision
             self.logger.info(f"Using pinned revision: {self.cfg.revision}")
 
+        # Conditional FlashAttention-2 (official recommendation, but only for Ampere+ GPUs)
+        model_kwargs = {
+            "device_map": device_map,
+            "torch_dtype": torch_dtype,
+        }
+        model_kwargs.update(load_kwargs)
+
+        if torch.cuda.is_available() and gpu_major >= 8:
+            # FlashAttention-2 available on Ampere+ (SM80+: A100, A10, RTX 30xx/40xx)
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            self.logger.info("Using FlashAttention-2 (Ampere+ GPU detected)")
+        elif torch.cuda.is_available():
+            self.logger.info(f"Using default attention (SM{gpu_major}{gpu_minor} < SM80, FlashAttention-2 not supported)")
+
         try:
-            self._processor = AutoProcessor.from_pretrained(model_path, **load_kwargs)
+            # use_fast=False for consistency with slow processor (explicit, silences warning)
+            self._processor = AutoProcessor.from_pretrained(
+                model_path, use_fast=False, **load_kwargs
+            )
             self._model = AutoModelForCausalLM.from_pretrained(
-                model_path, device_map=device_map, torch_dtype=torch_dtype, **load_kwargs
+                model_path, **model_kwargs
             ).eval()
         except ModuleNotFoundError as exc:
             if "transformers_modules" in str(exc) and "dots" in str(exc):
@@ -945,7 +965,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-new-tokens", type=int, default=4096,
-        help="Maximum new tokens to generate (default: 4096)"
+        help="Maximum new tokens to generate (default: 4096). Use 12000-24000 for pages with large tables."
     )
     parser.add_argument(
         "--disable-fallback", action="store_true",
