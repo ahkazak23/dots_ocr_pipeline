@@ -53,29 +53,36 @@ KNOWN_WORKING_REVISIONS = [
     "a8d3ef4909f446efcb48c9b17c3a9b0ddf5de6ff",  # Alternate stable revision
 ]
 
-# Prompt modes per model card
+# Prompt modes - using official prompt with necessary constraints
 PROMPT_MODES = {
-    "layout_all_en": """Please analyze this document image and extract all layout information including:
-- bbox (bounding box in [x1,y1,x2,y2] format, in pixels)
-- category (one of: Caption, Footnote, Formula, List-item, Page-footer, Page-header, Picture, Section-header, Table, Text, Title)
-- text content (following these rules):
-  * Picture: omit text
-  * Formula: use LaTeX format
-  * Table: use HTML format
-  * Others: use Markdown format
+    "layout_all_en": """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
 
-Important rules:
-- Do not translate; keep original text
-- Sort elements by human reading order
-- Output must be a single JSON object with an array of elements
+1. Bbox format: [x1, y1, x2, y2]
 
-Return ONLY the JSON object, no additional text.""",
+2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].
+
+3. Text Extraction & Formatting Rules:
+    - Picture: For the 'Picture' category, the text field should be omitted.
+    - Formula: Format its text as LaTeX.
+    - Table: Format its text as HTML.
+    - All Others (Text, Title, etc.): Format their text as Markdown.
+
+4. Constraints:
+    - The output text must be the original text from the image, with no translation.
+    - All layout elements must be sorted according to human reading order.
+
+5. Final Output: The entire output must be a single JSON object.
+
+IMPORTANT: The JSON must have the exact top-level format: {"elements":[ ... ]} (do not output a bare JSON array).
+IMPORTANT: For every element except category="Picture", include a non-empty "text" field. For Table, "text" must be valid HTML (<table>...</table>).""",
 
     "ocr": """Extract all text from this document image in reading order. Return plain text only.""",
 
     "layout_only_en": """Detect all layout blocks in this document image including bounding boxes and categories.
 Categories: Caption, Footnote, Formula, List-item, Page-footer, Page-header, Picture, Section-header, Table, Text, Title
-Return ONLY a JSON object with layout information.""",
+
+IMPORTANT: The JSON must have the exact top-level format: {"elements":[ ... ]} (do not output a bare JSON array).
+Return ONLY the JSON object.""",
 }
 
 # Category mapping: dots.ocr categories → unified block types
@@ -431,7 +438,14 @@ class TransformersBackend:
 
         with torch.inference_mode():
             try:
-                generated_ids = self._model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+                # Deterministic generation to prevent format drift
+                generated_ids = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    temperature=0.0,
+                    top_p=1.0,
+                )
             except Exception as exc:
                 self.logger.error(f"Generation failed: {type(exc).__name__}: {exc}")
                 return InferResult(
@@ -624,9 +638,15 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
         parsed = json.loads(text)
         if isinstance(parsed, list):
             warnings.append("wrapped_list_into_elements")
-            return {"elements": parsed}, warnings
+            parsed = {"elements": parsed}
+
+        # Validate schema after wrapping
         if isinstance(parsed, dict):
+            validation_result = _validate_dots_schema(parsed, logger)
+            if validation_result:
+                warnings.extend(validation_result)
             return parsed, warnings
+
         warnings.append(f"unexpected_json_type:{type(parsed).__name__}")
         return None, warnings
     except Exception:
@@ -640,8 +660,13 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
             warnings.append("json_extracted_balanced")
             if isinstance(parsed, list):
                 warnings.append("wrapped_list_into_elements")
-                return {"elements": parsed}, warnings
+                parsed = {"elements": parsed}
+
+            # Validate schema after wrapping
             if isinstance(parsed, dict):
+                validation_result = _validate_dots_schema(parsed, logger)
+                if validation_result:
+                    warnings.extend(validation_result)
                 return parsed, warnings
         except Exception:
             pass
@@ -651,6 +676,53 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
         preview = text[:1200] + ("..." if len(text) > 1200 else "")
         logger.warning(f"JSON parse failed. Output preview:\n{preview}")
     return None, warnings
+
+
+def _validate_dots_schema(parsed: Dict[str, Any], logger: Optional[logging.Logger] = None) -> List[str]:
+    """Validate dots.ocr JSON schema. Returns list of validation warnings."""
+    warnings = []
+
+    # Must have elements list
+    if "elements" not in parsed:
+        warnings.append("schema_error:missing_elements_key")
+        return warnings
+
+    elements = parsed["elements"]
+    if not isinstance(elements, list):
+        warnings.append("schema_error:elements_not_list")
+        return warnings
+
+    # Allowed categories
+    allowed_categories = {
+        'Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer',
+        'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'
+    }
+
+    # Validate each element
+    for idx, elem in enumerate(elements):
+        if not isinstance(elem, dict):
+            warnings.append(f"schema_error:element_{idx}_not_dict")
+            continue
+
+        # Check required fields
+        if "bbox" not in elem:
+            warnings.append(f"schema_error:element_{idx}_missing_bbox")
+        elif not isinstance(elem["bbox"], list) or len(elem["bbox"]) != 4:
+            warnings.append(f"schema_error:element_{idx}_invalid_bbox")
+
+        if "category" not in elem:
+            warnings.append(f"schema_error:element_{idx}_missing_category")
+        elif elem["category"] not in allowed_categories:
+            warnings.append(f"schema_warning:element_{idx}_unknown_category_{elem['category']}")
+
+        # Check text field requirement
+        category = elem.get("category", "")
+        if category != "Picture" and "text" not in elem:
+            warnings.append(f"schema_warning:element_{idx}_missing_text_for_{category}")
+        elif category != "Picture" and not elem.get("text", "").strip():
+            warnings.append(f"schema_warning:element_{idx}_empty_text_for_{category}")
+
+    return warnings
 
 
 def _extract_first_balanced_json(s: str) -> Optional[str]:
