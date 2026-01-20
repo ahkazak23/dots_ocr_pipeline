@@ -2,7 +2,9 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+out_json
+evaluation_output
+samples
 # C extensions
 *.so
 .idea

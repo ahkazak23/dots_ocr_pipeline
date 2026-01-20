@@ -153,6 +153,7 @@ class DotsOcrConfig:
     device: str = "auto"
     dtype: str = "bfloat16"
     trust_remote_code: bool = True
+    revision: Optional[str] = None  # Pin model version for reproducibility
 
 
 # ----------------------------
@@ -187,7 +188,7 @@ class TransformersBackend:
 
     def _load_model(self):
         import torch
-        from transformers import AutoModelForCausalLM, Qwen2VLProcessor
+        from transformers import AutoModelForCausalLM, AutoProcessor
 
         model_path = self.cfg.model_path or MODEL_ID
         self.logger.info(f"Loading dots.ocr model from {model_path}...")
@@ -199,6 +200,13 @@ class TransformersBackend:
             "float16": torch.float16,
             "float32": torch.float32
         }.get(self.cfg.dtype, torch.float32)
+
+        # T4 does NOT support bf16 well; force fp16 on older CUDA cards
+        if torch.cuda.is_available() and torch_dtype == torch.bfloat16:
+            major, minor = torch.cuda.get_device_capability(0)
+            if major < 8:  # bf16 is Ampere+ (SM80+)
+                self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16.")
+                torch_dtype = torch.float16
 
         # GPU memory check
         if torch.cuda.is_available():
@@ -223,10 +231,16 @@ class TransformersBackend:
         else:
             self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
 
-        self._processor = Qwen2VLProcessor.from_pretrained(model_path, trust_remote_code=self.cfg.trust_remote_code)
+        # Prepare from_pretrained kwargs
+        load_kwargs = {
+            "trust_remote_code": self.cfg.trust_remote_code,
+        }
+        if self.cfg.revision:
+            load_kwargs["revision"] = self.cfg.revision
+
+        self._processor = AutoProcessor.from_pretrained(model_path, **load_kwargs)
         self._model = AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=self.cfg.trust_remote_code,
-            device_map=device_map, torch_dtype=torch_dtype,
+            model_path, device_map=device_map, torch_dtype=torch_dtype, **load_kwargs
         ).eval()
 
         self.logger.info("Model loaded successfully.")
@@ -268,7 +282,10 @@ class TransformersBackend:
 
         input_len = inputs.input_ids.shape[1]
         generated_ids_trimmed = [out_ids[input_len:] for out_ids in generated_ids]
-        output_text = self._processor.batch_decode(
+
+        # Robust decoding: some processors put batch_decode on tokenizer
+        decoder = getattr(self._processor, "tokenizer", self._processor)
+        output_text = decoder.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
@@ -891,6 +908,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Local model path (default: download from HuggingFace)"
     )
     parser.add_argument(
+        "--revision", default=None,
+        help="Model revision/commit hash to pin (for reproducibility)"
+    )
+    parser.add_argument(
         "--prompt-mode", default="layout_all_en",
         choices=list(PROMPT_MODES.keys()),
         help="Prompt mode (default: layout_all_en)"
@@ -961,6 +982,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_path=args.model_path,
         device=args.device,
         dtype=args.dtype,
+        revision=args.revision,
     )
 
     # Gather inputs
