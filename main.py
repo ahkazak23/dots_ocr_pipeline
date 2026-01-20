@@ -451,6 +451,10 @@ class TransformersBackend:
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
+        # Strip model special tokens that may break JSON parsing
+        output_text = output_text.replace("<|endofassistant|>", "").strip()
+        output_text = output_text.replace("<|im_end|>", "").strip()  # Common Qwen token
+
         output_tokens = len(generated_ids_trimmed[0])
         infer_time = time.time() - t0
 
@@ -605,43 +609,99 @@ class PipelineBackend:
 # ----------------------------
 
 def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    """Parse model output to JSON with hardening. Returns (parsed_dict, warnings_list)."""
+    """Parse dots.ocr output into a dict. Accepts dict or list; wraps list into {'elements': list}."""
     warnings = []
-
     if not raw_text or not raw_text.strip():
-        warnings.append("empty_output")
-        return None, warnings
+        return None, ["empty_output"]
 
+    text = raw_text.strip()
+
+    # Remove known special tokens that break JSON
+    text = text.replace("<|endofassistant|>", "").strip()
+
+    # Try direct JSON load first (supports dict OR list)
     try:
-        return json.loads(raw_text), warnings
-    except json.JSONDecodeError:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            warnings.append("wrapped_list_into_elements")
+            return {"elements": parsed}, warnings
+        if isinstance(parsed, dict):
+            return parsed, warnings
+        warnings.append(f"unexpected_json_type:{type(parsed).__name__}")
+        return None, warnings
+    except Exception:
         pass
 
-    # Extract substring from first { to last }
-    first_brace, last_brace = raw_text.find("{"), raw_text.rfind("}")
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+    # Balanced extraction: find first balanced {...} or [...] inside mixed output
+    extracted = _extract_first_balanced_json(text)
+    if extracted is not None:
         try:
-            parsed = json.loads(raw_text[first_brace:last_brace + 1])
-            warnings.append("json_extracted_from_substring")
-            return parsed, warnings
-        except json.JSONDecodeError:
+            parsed = json.loads(extracted)
+            warnings.append("json_extracted_balanced")
+            if isinstance(parsed, list):
+                warnings.append("wrapped_list_into_elements")
+                return {"elements": parsed}, warnings
+            if isinstance(parsed, dict):
+                return parsed, warnings
+        except Exception:
             pass
 
     warnings.append("json_parse_failed")
-
-    # Log the raw output for debugging (first 500 chars)
     if logger:
-        preview = raw_text[:500] if len(raw_text) > 500 else raw_text
-        logger.debug(f"Failed to parse JSON. Raw output preview: {preview}")
-
+        preview = text[:1200] + ("..." if len(text) > 1200 else "")
+        logger.warning(f"JSON parse failed. Output preview:\n{preview}")
     return None, warnings
+
+
+def _extract_first_balanced_json(s: str) -> Optional[str]:
+    """Extract first balanced {...} or [...] from string."""
+    # Find first '{' or '['
+    starts = [(s.find("{"), "{"), (s.find("["), "[")]
+    starts = [(i, ch) for (i, ch) in starts if i != -1]
+    if not starts:
+        return None
+
+    start_idx, start_ch = min(starts, key=lambda x: x[0])
+    end_ch = "}" if start_ch == "{" else "]"
+
+    depth = 0
+    in_str = False
+    esc = False
+
+    for i in range(start_idx, len(s)):
+        c = s[i]
+
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+
+        if c == '"':
+            in_str = True
+            continue
+
+        if c == start_ch:
+            depth += 1
+        elif c == end_ch:
+            depth -= 1
+            if depth == 0:
+                return s[start_idx:i + 1]
+
+    return None
 
 
 def run_page_ocr_with_fallback(
     backend: Backend, image: Image.Image, cfg: Config, logger: logging.Logger, page_id: str = ""
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """Run OCR with prompt fallback chain: layout_all_en → ocr → layout_only_en."""
-    fallback_chain = ["layout_all_en", "ocr", "layout_only_en"] if cfg.fallback_enabled else [cfg.prompt_mode]
+    """Run OCR with prompt fallback chain: layout_all_en → layout_only_en.
+
+    Note: 'ocr' mode removed from chain as it returns plain text/HTML, not JSON.
+    """
+    fallback_chain = ["layout_all_en", "layout_only_en"] if cfg.fallback_enabled else [cfg.prompt_mode]
     all_diagnostics, total_time = [], 0.0
 
     for attempt_idx, prompt_mode in enumerate(fallback_chain, start=1):
