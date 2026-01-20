@@ -244,10 +244,11 @@ class TransformersBackend:
             gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
 
         # Dtype selection with T4 workaround
-        # T4 (SM75) has mixed precision issues - use "auto" to let model choose
+        # T4 (SM75) has mixed precision issues - force float32 to avoid dtype mismatch
         if torch.cuda.is_available() and gpu_major < 8 and self.cfg.dtype == "bfloat16":
-            self.logger.warning("GPU is SM75 (T4). Model has mixed precision - using dtype='auto' to avoid conflicts.")
-            torch_dtype = "auto"
+            self.logger.warning("GPU is SM75 (T4). Forcing dtype=float32 to avoid mixed precision conflicts.")
+            self.logger.warning("This will be slower but stable. For speed, use an Ampere+ GPU (A100, RTX 30xx+).")
+            torch_dtype = torch.float32
         else:
             torch_dtype = {
                 "bfloat16": torch.bfloat16,
@@ -255,6 +256,8 @@ class TransformersBackend:
                 "float32": torch.float32,
                 "auto": "auto"
             }.get(self.cfg.dtype, torch.float32)
+
+        self.logger.info(f"Using dtype: {torch_dtype}")
 
         # GPU memory check
         if torch.cuda.is_available():
