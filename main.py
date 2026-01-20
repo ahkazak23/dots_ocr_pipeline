@@ -237,21 +237,24 @@ class TransformersBackend:
             model_path = str(local_model_dir)
 
         device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
-        torch_dtype = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32
-        }.get(self.cfg.dtype, torch.float32)
 
         # Detect GPU capabilities for optimal settings
         gpu_major, gpu_minor = None, None
         if torch.cuda.is_available():
             gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
 
-            # T4 does NOT support bf16 well; force fp16 on older CUDA cards
-            if torch_dtype == torch.bfloat16 and gpu_major < 8:  # bf16 is Ampere+ (SM80+)
-                self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16.")
-                torch_dtype = torch.float16
+        # Dtype selection with T4 workaround
+        # T4 (SM75) has mixed precision issues - use "auto" to let model choose
+        if torch.cuda.is_available() and gpu_major < 8 and self.cfg.dtype == "bfloat16":
+            self.logger.warning("GPU is SM75 (T4). Model has mixed precision - using dtype='auto' to avoid conflicts.")
+            torch_dtype = "auto"
+        else:
+            torch_dtype = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "auto": "auto"
+            }.get(self.cfg.dtype, torch.float32)
 
         # GPU memory check
         if torch.cuda.is_available():
