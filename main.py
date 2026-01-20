@@ -47,6 +47,12 @@ except ImportError:
 MODEL_ID = "rednote-hilab/dots.ocr"
 MAX_PIXEL_AREA = 11_289_600  # Model recommendation: width * height <= 11,289,600
 
+# Known working model revisions (use with --revision flag if latest is broken)
+KNOWN_WORKING_REVISIONS = [
+    "7c5cb72f99e934b9ef1bcfc58ea169eeab30fb5d",  # Stable as of Jan 2026
+    "a8d3ef4909f446efcb48c9b17c3a9b0ddf5de6ff",  # Alternate stable revision
+]
+
 # Prompt modes per model card
 PROMPT_MODES = {
     "layout_all_en": """Please analyze this document image and extract all layout information including:
@@ -237,11 +243,32 @@ class TransformersBackend:
         }
         if self.cfg.revision:
             load_kwargs["revision"] = self.cfg.revision
+            self.logger.info(f"Using pinned revision: {self.cfg.revision}")
 
-        self._processor = AutoProcessor.from_pretrained(model_path, **load_kwargs)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            model_path, device_map=device_map, torch_dtype=torch_dtype, **load_kwargs
-        ).eval()
+        try:
+            self._processor = AutoProcessor.from_pretrained(model_path, **load_kwargs)
+            self._model = AutoModelForCausalLM.from_pretrained(
+                model_path, device_map=device_map, torch_dtype=torch_dtype, **load_kwargs
+            ).eval()
+        except ModuleNotFoundError as exc:
+            if "transformers_modules" in str(exc) and "dots" in str(exc):
+                self.logger.error("=" * 80)
+                self.logger.error("MODEL LOADING FAILED: The latest model code has broken imports.")
+                self.logger.error("SOLUTION: Pin to a working revision using --revision flag")
+                self.logger.error("")
+                self.logger.error("Try one of these known working revisions:")
+                self.logger.error("  --revision 7c5cb72f99e934b9ef1bcfc58ea169eeab30fb5d")
+                self.logger.error("  --revision a8d3ef4909f446efcb48c9b17c3a9b0ddf5de6ff")
+                self.logger.error("")
+                self.logger.error("Example command:")
+                self.logger.error(f"  python main.py --input yourfile.pdf --revision 7c5cb72f99e934b9ef1bcfc58ea169eeab30fb5d")
+                self.logger.error("=" * 80)
+                raise RuntimeError(
+                    f"Model loading failed due to broken imports in latest model code. "
+                    f"Use --revision flag to pin to a working version (see error log above)."
+                ) from exc
+            else:
+                raise
 
         self.logger.info("Model loaded successfully.")
 
