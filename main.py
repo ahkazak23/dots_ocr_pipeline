@@ -244,6 +244,7 @@ class TransformersBackend:
 
         # Dtype selection with hardware-aware fallback (best practice)
         # Use bfloat16 on Ampere+ GPUs, fall back to float16 when bf16 isn't available
+        # NEVER use "auto" as it can cause mixed precision within the model
         if self.cfg.dtype == "bfloat16":
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 torch_dtype = torch.bfloat16
@@ -254,11 +255,22 @@ class TransformersBackend:
             else:
                 torch_dtype = torch.float32
                 self.logger.warning("CUDA not available. Using float32 on CPU.")
+        elif self.cfg.dtype == "auto":
+            # Don't allow "auto" - it can cause mixed precision issues
+            self.logger.warning("dtype='auto' not recommended (causes mixed precision). Auto-selecting based on hardware.")
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                torch_dtype = torch.bfloat16
+                self.logger.info("BF16 supported - using bfloat16")
+            elif torch.cuda.is_available():
+                torch_dtype = torch.float16
+                self.logger.info("Using float16")
+            else:
+                torch_dtype = torch.float32
+                self.logger.info("Using float32 on CPU")
         else:
             torch_dtype = {
                 "float16": torch.float16,
                 "float32": torch.float32,
-                "auto": "auto",
             }.get(self.cfg.dtype, torch.float32)
 
         self.logger.info(f"Using dtype: {torch_dtype}")
@@ -307,13 +319,14 @@ class TransformersBackend:
             model_kwargs = {
                 "trust_remote_code": self.cfg.trust_remote_code,
                 "device_map": device_map,
-                "torch_dtype": torch_dtype,
+                "torch_dtype": torch_dtype,  # Always explicit dtype, never "auto"
                 "local_files_only": True if self.cfg.model_path else False,
             }
             if use_flash_attn:
                 model_kwargs["attn_implementation"] = "flash_attention_2"
 
             self.logger.info(f"Loading model from {model_path}...")
+            self.logger.info(f"Model loading with dtype={torch_dtype}, device_map={device_map}")
             self._model = AutoModelForCausalLM.from_pretrained(
                 model_path, **model_kwargs
             ).eval()
@@ -334,14 +347,25 @@ class TransformersBackend:
 
         self.logger.info("Model loaded successfully.")
 
-        # Additional safety: ensure model is in the expected dtype
-        # (handles cases where model loaded with mixed precision)
+        # CRITICAL: Force entire model to uniform dtype to prevent mixed precision issues
+        # device_map="auto" can cause some layers to be fp16 and others bf16, leading to:
+        # "RuntimeError: Input type (c10::BFloat16) and bias type (c10::Half) should be the same"
         if torch_dtype not in ["auto", None]:
-            actual_dtype = next(self._model.parameters()).dtype
-            if actual_dtype != torch_dtype:
-                self.logger.warning(f"Model loaded in {actual_dtype} but expected {torch_dtype}. Converting...")
-                self._model = self._model.to(dtype=torch_dtype)
-                self.logger.info(f"Model converted to {torch_dtype}")
+            # Check for mixed precision in model
+            param_dtypes = {p.dtype for p in self._model.parameters()}
+            if len(param_dtypes) > 1:
+                self.logger.warning(f"Model has mixed precision parameters: {param_dtypes}")
+                self.logger.warning(f"Converting entire model to uniform dtype: {torch_dtype}")
+
+            # Force all parameters to the target dtype
+            self._model = self._model.to(dtype=torch_dtype)
+
+            # Verify conversion
+            final_dtypes = {p.dtype for p in self._model.parameters()}
+            if len(final_dtypes) == 1:
+                self.logger.info(f"Model unified to dtype: {next(iter(final_dtypes))}")
+            else:
+                self.logger.error(f"Warning: Model still has mixed dtypes after conversion: {final_dtypes}")
 
     def _cast_floating_inputs_to_model_dtype(self, inputs):
         """Cast floating-point tensors in inputs to match model's dtype.
