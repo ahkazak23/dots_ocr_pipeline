@@ -242,14 +242,20 @@ class TransformersBackend:
         if torch.cuda.is_available():
             gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
 
-        # Dtype selection with T4 workaround
-        # T4 (SM75) does not support bf16 well - switch to fp16
-        if torch.cuda.is_available() and gpu_major < 8 and self.cfg.dtype == "bfloat16":
-            self.logger.warning("GPU < SM80 (e.g., T4). Switching dtype bfloat16 -> float16.")
-            torch_dtype = torch.float16
+        # Dtype selection with hardware-aware fallback (best practice)
+        # Use bfloat16 on Ampere+ GPUs, fall back to float16 when bf16 isn't available
+        if self.cfg.dtype == "bfloat16":
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                torch_dtype = torch.bfloat16
+                self.logger.info("BF16 supported - using bfloat16 for optimal performance")
+            elif torch.cuda.is_available():
+                torch_dtype = torch.float16
+                self.logger.warning("BF16 not supported on this GPU (e.g., T4). Using float16 instead.")
+            else:
+                torch_dtype = torch.float32
+                self.logger.warning("CUDA not available. Using float32 on CPU.")
         else:
             torch_dtype = {
-                "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
                 "auto": "auto",
@@ -327,6 +333,15 @@ class TransformersBackend:
             raise
 
         self.logger.info("Model loaded successfully.")
+
+        # Additional safety: ensure model is in the expected dtype
+        # (handles cases where model loaded with mixed precision)
+        if torch_dtype not in ["auto", None]:
+            actual_dtype = next(self._model.parameters()).dtype
+            if actual_dtype != torch_dtype:
+                self.logger.warning(f"Model loaded in {actual_dtype} but expected {torch_dtype}. Converting...")
+                self._model = self._model.to(dtype=torch_dtype)
+                self.logger.info(f"Model converted to {torch_dtype}")
 
     def _cast_floating_inputs_to_model_dtype(self, inputs):
         """Cast floating-point tensors in inputs to match model's dtype.
