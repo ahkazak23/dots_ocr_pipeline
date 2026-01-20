@@ -183,7 +183,7 @@ class Backend(Protocol):
 # ----------------------------
 
 class TransformersBackend:
-    """HuggingFace Transformers backend for dots.ocr inference."""
+    """HuggingFace Transformers backend for dots.ocr inference (low-level API)."""
 
     def __init__(self, cfg: DotsOcrConfig, logger: logging.Logger):
         self.cfg = cfg
@@ -363,6 +363,136 @@ class TransformersBackend:
             diagnostics={"prompt_mode": prompt_mode, "time_sec": round(infer_time, 4),
                         "output_tokens": output_tokens, "warnings": warnings_list}
         )
+
+
+# ----------------------------
+# PipelineBackend
+# ----------------------------
+
+class PipelineBackend:
+    """HuggingFace Transformers pipeline backend for dots.ocr (high-level API)."""
+
+    def __init__(self, cfg: DotsOcrConfig, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+        self._pipe = None
+        self._load_pipeline()
+
+    def _load_pipeline(self):
+        import torch
+        from transformers import pipeline
+
+        model_path = self.cfg.model_path or MODEL_ID
+        self.logger.info(f"Loading dots.ocr pipeline from {model_path}...")
+        self.logger.info("Note: Pipeline API is simpler but has less control over model loading.")
+
+        # GPU detection for dtype
+        gpu_major, gpu_minor = None, None
+        torch_dtype = self.cfg.dtype
+        if torch.cuda.is_available():
+            gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
+            gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            self.logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB) - Compute Capability: SM{gpu_major}{gpu_minor}")
+
+            # T4 bf16 detection
+            if torch_dtype == "bfloat16" and gpu_major < 8:
+                self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16.")
+                torch_dtype = "float16"
+        else:
+            self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
+
+        # Pipeline kwargs
+        pipe_kwargs = {
+            "model": model_path,
+            "trust_remote_code": self.cfg.trust_remote_code,
+            "torch_dtype": torch_dtype,
+        }
+
+        if self.cfg.revision:
+            pipe_kwargs["revision"] = self.cfg.revision
+            self.logger.info(f"Using pinned revision: {self.cfg.revision}")
+
+        device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
+        if device_map != "auto":
+            pipe_kwargs["device"] = device_map
+
+        try:
+            self._pipe = pipeline("image-text-to-text", **pipe_kwargs)
+            self.logger.info("Pipeline loaded successfully.")
+        except Exception as exc:
+            self.logger.error(f"Pipeline loading failed: {type(exc).__name__}: {exc}")
+            if "trust_remote_code" in str(exc):
+                self.logger.error("Try running with trust_remote_code=True")
+            raise
+
+    def infer_page(self, image: Image.Image, prompt_mode: str, max_new_tokens: int) -> InferResult:
+        import time
+
+        t0 = time.time()
+        warnings_list = []
+
+        # Build messages for pipeline
+        prompt_text = PROMPT_MODES.get(prompt_mode, PROMPT_MODES["layout_all_en"])
+
+        # Convert PIL Image to format expected by pipeline
+        # Pipeline expects either path or PIL image directly
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt_text}
+                ]
+            }
+        ]
+
+        try:
+            # Pipeline inference
+            result = self._pipe(text=messages, max_new_tokens=max_new_tokens)
+
+            # Extract text from pipeline result
+            if isinstance(result, list) and len(result) > 0:
+                output_text = result[0].get("generated_text", "")
+            elif isinstance(result, dict):
+                output_text = result.get("generated_text", "")
+            else:
+                output_text = str(result)
+
+            infer_time = time.time() - t0
+
+            # Check for runaway patterns
+            for pattern in RUNAWAY_PATTERNS:
+                if pattern.search(output_text):
+                    warnings_list.append(f"runaway_pattern_detected: {pattern.pattern}")
+                    self.logger.warning(f"Runaway pattern detected: {pattern.pattern}")
+
+            # Parse JSON
+            parsed_json, parse_warnings = parse_model_output(output_text)
+            warnings_list.extend(parse_warnings)
+
+            return InferResult(
+                raw_text=output_text,
+                parsed_json=parsed_json,
+                diagnostics={
+                    "prompt_mode": prompt_mode,
+                    "time_sec": round(infer_time, 4),
+                    "output_tokens": len(output_text.split()),  # Approximate
+                    "warnings": warnings_list
+                }
+            )
+
+        except Exception as exc:
+            self.logger.error(f"Pipeline inference failed: {type(exc).__name__}: {exc}")
+            return InferResult(
+                raw_text="",
+                parsed_json=None,
+                diagnostics={
+                    "prompt_mode": prompt_mode,
+                    "time_sec": time.time() - t0,
+                    "output_tokens": 0,
+                    "warnings": [f"generation_error: {type(exc).__name__}: {exc}"]
+                }
+            )
 
 
 # ----------------------------
