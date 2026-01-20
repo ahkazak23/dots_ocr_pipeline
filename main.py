@@ -192,6 +192,15 @@ class TransformersBackend:
         self._processor = None
         self._load_model()
 
+    @staticmethod
+    def _flash_attn2_available() -> bool:
+        """Check if flash_attn package is installed."""
+        try:
+            import flash_attn  # noqa: F401
+            return True
+        except Exception:
+            return False
+
     def _load_model(self):
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
@@ -255,6 +264,12 @@ class TransformersBackend:
             else:
                 torch_dtype = torch.float32
                 self.logger.warning("CUDA not available. Using float32 on CPU.")
+        elif self.cfg.dtype == "float16":
+            torch_dtype = torch.float16
+            self.logger.info("Using explicit float16 (user requested)")
+        elif self.cfg.dtype == "float32":
+            torch_dtype = torch.float32
+            self.logger.info("Using explicit float32 (user requested)")
         elif self.cfg.dtype == "auto":
             # Don't allow "auto" - it can cause mixed precision issues
             self.logger.warning("dtype='auto' not recommended (causes mixed precision). Auto-selecting based on hardware.")
@@ -268,10 +283,9 @@ class TransformersBackend:
                 torch_dtype = torch.float32
                 self.logger.info("Using float32 on CPU")
         else:
-            torch_dtype = {
-                "float16": torch.float16,
-                "float32": torch.float32,
-            }.get(self.cfg.dtype, torch.float32)
+            # Fallback for unknown dtype
+            torch_dtype = torch.float32
+            self.logger.warning(f"Unknown dtype '{self.cfg.dtype}', defaulting to float32")
 
         self.logger.info(f"Using dtype: {torch_dtype}")
 
@@ -298,10 +312,15 @@ class TransformersBackend:
         else:
             self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
 
-        # Conditional FlashAttention-2 (official recommendation, but only for Ampere+ GPUs)
-        use_flash_attn = torch.cuda.is_available() and gpu_major >= 8
-        if use_flash_attn:
-            self.logger.info("Using FlashAttention-2 (Ampere+ GPU detected)")
+        # Conditional FlashAttention-2 (official recommendation, but only for Ampere+ GPUs with flash_attn installed)
+        use_flash_attn = torch.cuda.is_available() and gpu_major >= 8 and self._flash_attn2_available()
+
+        if torch.cuda.is_available() and gpu_major >= 8:
+            if use_flash_attn:
+                self.logger.info("Using FlashAttention-2 (installed + Ampere+ GPU detected)")
+            else:
+                self.logger.warning("Ampere+ GPU detected but flash_attn not installed; using default attention")
+                self.logger.warning("For faster inference, install: pip install flash-attn --no-build-isolation")
         elif torch.cuda.is_available():
             self.logger.info(f"Using default attention (SM{gpu_major}{gpu_minor} < SM80, FlashAttention-2 not supported)")
 
@@ -372,13 +391,17 @@ class TransformersBackend:
 
         Prevents dtype mismatch errors like:
         'Input type (c10::BFloat16) and bias type (c10::Half) should be the same'
+
+        This ensures ALL floating tensors match the model's dtype before inference.
         """
         import torch
         model_dtype = next(self._model.parameters()).dtype
+
         for k in list(inputs.keys()):
             v = inputs[k]
-            if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != model_dtype:
+            if isinstance(v, torch.Tensor) and v.dtype.is_floating_point and v.dtype != model_dtype:
                 inputs[k] = v.to(dtype=model_dtype)
+
         return inputs
 
     def infer_page(self, image: Image.Image, prompt_mode: str, max_new_tokens: int) -> InferResult:
