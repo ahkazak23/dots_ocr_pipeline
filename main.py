@@ -200,6 +200,42 @@ class TransformersBackend:
         self.logger.info(f"Loading dots.ocr model from {model_path}...")
         self.logger.info("Note: First run will download ~4-8GB model files from HuggingFace.")
 
+        # WORKAROUND: The model name "dots.ocr" has a dot which breaks Python module imports
+        # We need to download and rename locally if loading from HuggingFace
+        if model_path == MODEL_ID and not self.cfg.model_path:
+            self.logger.warning("Model name 'dots.ocr' contains a dot which causes import errors.")
+            self.logger.warning("Workaround: Downloading to local directory and renaming...")
+
+            # Download to local directory with underscore name
+            from pathlib import Path
+            import os
+
+            local_model_dir = Path.home() / ".cache" / "dots_ocr_renamed"
+            local_model_dir.mkdir(parents=True, exist_ok=True)
+
+            # Clone from HuggingFace if not already present
+            if not (local_model_dir / "config.json").exists():
+                self.logger.info(f"Downloading model to {local_model_dir}...")
+                try:
+                    from huggingface_hub import snapshot_download
+
+                    # Download with optional revision
+                    download_kwargs = {"repo_id": MODEL_ID, "local_dir": str(local_model_dir)}
+                    if self.cfg.revision:
+                        download_kwargs["revision"] = self.cfg.revision
+                        self.logger.info(f"Using pinned revision: {self.cfg.revision}")
+
+                    snapshot_download(**download_kwargs)
+                    self.logger.info("Model downloaded successfully.")
+                except ImportError:
+                    self.logger.error("huggingface_hub not installed. Install with: pip install huggingface_hub")
+                    raise
+            else:
+                self.logger.info(f"Using cached model from {local_model_dir}")
+
+            # Use local path
+            model_path = str(local_model_dir)
+
         device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
         torch_dtype = {
             "bfloat16": torch.bfloat16,
@@ -240,10 +276,6 @@ class TransformersBackend:
         else:
             self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
 
-        # Strategy: Split processor/model loading to handle version incompatibilities
-        # - Processor: Load from main (has preprocessor_config.json)
-        # - Model: Load from pinned revision (has working imports)
-
         # Conditional FlashAttention-2 (official recommendation, but only for Ampere+ GPUs)
         use_flash_attn = torch.cuda.is_available() and gpu_major >= 8
         if use_flash_attn:
@@ -252,53 +284,43 @@ class TransformersBackend:
             self.logger.info(f"Using default attention (SM{gpu_major}{gpu_minor} < SM80, FlashAttention-2 not supported)")
 
         try:
-            # Load processor from main branch (always has latest preprocessor_config.json)
-            self.logger.info("Loading processor from main branch (has preprocessor_config.json)...")
+            # Load from local directory (no split loading needed since we renamed the repo)
+            self.logger.info(f"Loading processor from {model_path}...")
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
                 trust_remote_code=self.cfg.trust_remote_code,
                 use_fast=False,
-                # No revision - use main for processor
+                local_files_only=True if self.cfg.model_path else False,
             )
 
-            # Load model with optional revision pinning
+            # Load model
             model_kwargs = {
                 "trust_remote_code": self.cfg.trust_remote_code,
                 "device_map": device_map,
                 "torch_dtype": torch_dtype,
+                "local_files_only": True if self.cfg.model_path else False,
             }
             if use_flash_attn:
                 model_kwargs["attn_implementation"] = "flash_attention_2"
 
-            if self.cfg.revision:
-                model_kwargs["revision"] = self.cfg.revision
-                self.logger.info(f"Loading model from pinned revision: {self.cfg.revision}")
-            else:
-                self.logger.warning("No --revision specified. Using main branch (may have broken imports).")
-
+            self.logger.info(f"Loading model from {model_path}...")
             self._model = AutoModelForCausalLM.from_pretrained(
                 model_path, **model_kwargs
             ).eval()
 
-        except ModuleNotFoundError as exc:
-            if "transformers_modules" in str(exc) and "dots" in str(exc):
+        except Exception as exc:
+            if "ModuleNotFoundError" in str(type(exc).__name__) and "dots" in str(exc):
                 self.logger.error("=" * 80)
-                self.logger.error("MODEL LOADING FAILED: The latest model code has broken imports.")
-                self.logger.error("SOLUTION: Pin to a working revision using --revision flag")
+                self.logger.error("MODEL LOADING FAILED: The model name 'dots.ocr' contains a dot.")
+                self.logger.error("Python treats the dot as a module separator, causing import errors.")
                 self.logger.error("")
-                self.logger.error("Try one of these known working revisions:")
-                for rev in KNOWN_WORKING_REVISIONS:
-                    self.logger.error(f"  --revision {rev}")
-                self.logger.error("")
-                self.logger.error("Example command:")
-                self.logger.error(f"  python main.py --input yourfile.pdf --revision {KNOWN_WORKING_REVISIONS[0]}")
+                self.logger.error("SOLUTION: Model should be auto-downloaded and renamed.")
+                self.logger.error("If this persists, manually:")
+                self.logger.error("  1. Download: huggingface-cli download rednote-hilab/dots.ocr")
+                self.logger.error("  2. Rename folder: dots.ocr -> dots_ocr")
+                self.logger.error("  3. Use: --model-path /path/to/dots_ocr")
                 self.logger.error("=" * 80)
-                raise RuntimeError(
-                    f"Model loading failed due to broken imports in latest model code. "
-                    f"Use --revision flag to pin to a working version (see error log above)."
-                ) from exc
-            else:
-                raise
+            raise
 
         self.logger.info("Model loaded successfully.")
 
