@@ -47,11 +47,7 @@ except ImportError:
 MODEL_ID = "rednote-hilab/dots.ocr"
 MAX_PIXEL_AREA = 11_289_600  # Model recommendation: width * height <= 11,289,600
 
-# Known working model revisions (use with --revision flag if latest is broken)
-KNOWN_WORKING_REVISIONS = [
-    "7c5cb72f99e934b9ef1bcfc58ea169eeab30fb5d",  # Stable as of Jan 2026
-    "a8d3ef4909f446efcb48c9b17c3a9b0ddf5de6ff",  # Alternate stable revision
-]
+
 
 # Prompt modes - using official prompt with necessary constraints
 PROMPT_MODES = {
@@ -166,7 +162,6 @@ class DotsOcrConfig:
     device: str = "auto"
     dtype: str = "bfloat16"
     trust_remote_code: bool = True
-    revision: Optional[str] = None  # Pin model version for reproducibility
 
 
 # ----------------------------
@@ -234,13 +229,7 @@ class TransformersBackend:
                 try:
                     from huggingface_hub import snapshot_download
 
-                    # Download with optional revision
-                    download_kwargs = {"repo_id": MODEL_ID, "local_dir": str(local_model_dir)}
-                    if self.cfg.revision:
-                        download_kwargs["revision"] = self.cfg.revision
-                        self.logger.info(f"Using pinned revision: {self.cfg.revision}")
-
-                    snapshot_download(**download_kwargs)
+                    snapshot_download(repo_id=MODEL_ID, local_dir=str(local_model_dir))
                     self.logger.info("Model downloaded successfully.")
                 except ImportError:
                     self.logger.error("huggingface_hub not installed. Install with: pip install huggingface_hub")
@@ -531,9 +520,6 @@ class PipelineBackend:
             "torch_dtype": torch_dtype,
         }
 
-        if self.cfg.revision:
-            pipe_kwargs["revision"] = self.cfg.revision
-            self.logger.info(f"Using pinned revision: {self.cfg.revision}")
 
         device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
         if device_map != "auto":
@@ -1322,6 +1308,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output directory for JSON files"
     )
     parser.add_argument(
+        "--eval-output-dir", default="./evaluation_output",
+        help="Directory for evaluation run summaries (default: ./evaluation_output)"
+    )
+    parser.add_argument(
         "--dpi", type=int, default=200,
         help="DPI for PDF rendering (default: 200)"
     )
@@ -1336,10 +1326,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-path", default=None,
         help="Local model path (default: download from HuggingFace)"
-    )
-    parser.add_argument(
-        "--revision", default=None,
-        help="Model revision/commit hash to pin (for reproducibility)"
     )
     parser.add_argument(
         "--prompt-mode", default="layout_all_en",
@@ -1397,6 +1383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = Config(
         dpi=args.dpi,
         out_dir=args.output_dir,
+        eval_out_dir=args.eval_output_dir,
         prompt_mode=args.prompt_mode,
         max_new_tokens=args.max_new_tokens,
         fallback_enabled=not args.disable_fallback,
@@ -1412,7 +1399,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_path=args.model_path,
         device=args.device,
         dtype=args.dtype,
-        revision=args.revision,
     )
 
     # Gather inputs
