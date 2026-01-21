@@ -1,0 +1,30 @@
+# DeepSeek-OCR Pipeline Requirements
+# For use with deepseek-ocr.py
+
+# Core dependencies
+pillow>=11.3.0
+PyMuPDF>=1.26.7
+
+# PyTorch (DeepSeek officially uses 2.6.0, but 2.7.0 should work)
+torch==2.6.0
+torchvision>=0.21.0
+torchaudio==2.6.0
+
+# Transformers & HuggingFace
+transformers==4.46.3
+safetensors>=0.7.0
+huggingface-hub>=0.36.0
+tokenizers>=0.20.3
+accelerate>=1.12.0
+
+# DeepSeek-OCR specific dependencies
+addict
+einops
+easydict
+matplotlib
+
+# NumPy
+numpy>=2.4.0
+
+# Optional: colorama for colored terminal output
+colorama
