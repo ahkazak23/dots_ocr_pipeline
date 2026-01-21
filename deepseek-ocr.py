@@ -1075,6 +1075,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek-OCR pipeline")
     parser.add_argument("--input", required=True, help="Path to a PDF, image, or folder of files")
     parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
+    parser.add_argument("--eval-output-dir", default="./evaluation_output", help="Directory for evaluation run summaries (default: ./evaluation_output)")
     parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
     parser.add_argument("--revision", default=None, help="Optional model revision")
@@ -1156,6 +1157,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         backend=backend,
         dpi=args.dpi,
         out_dir=args.output_dir,
+        eval_out_dir=args.eval_output_dir,
         log_level=args.log_level,
         debug_keep_renders=bool(args.keep_renders),
         save_bbox_overlay=not args.no_bbox_overlay,
