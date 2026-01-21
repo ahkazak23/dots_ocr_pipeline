@@ -836,6 +836,92 @@ def render_pdf_to_images(
 # Normalization
 # ----------------------------
 
+def _parse_html_table_to_structure(html_text: str, logger: Optional[logging.Logger] = None) -> Optional[Dict[str, Any]]:
+    """Parse HTML table into structured format with headers and rows.
+
+    Returns:
+        {
+            "headers": [["col1", "col2", ...]],  # Can be multi-row headers
+            "rows": [[cell1, cell2, ...], ...]
+        }
+    """
+    try:
+        from html.parser import HTMLParser
+
+        class TableParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.in_thead = False
+                self.in_tbody = False
+                self.in_tr = False
+                self.in_th = False
+                self.in_td = False
+                self.headers = []
+                self.rows = []
+                self.current_row = []
+                self.current_cell = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "thead":
+                    self.in_thead = True
+                elif tag == "tbody":
+                    self.in_tbody = True
+                elif tag == "tr":
+                    self.in_tr = True
+                    self.current_row = []
+                elif tag == "th":
+                    self.in_th = True
+                    self.current_cell = []
+                elif tag == "td":
+                    self.in_td = True
+                    self.current_cell = []
+
+            def handle_endtag(self, tag):
+                if tag == "thead":
+                    self.in_thead = False
+                elif tag == "tbody":
+                    self.in_tbody = False
+                elif tag == "tr":
+                    self.in_tr = False
+                    if self.in_thead or (not self.in_thead and not self.in_tbody):
+                        # Row in <thead> or before <tbody> = header row
+                        if self.current_row:
+                            self.headers.append(self.current_row)
+                    else:
+                        # Row in <tbody> = data row
+                        if self.current_row:
+                            self.rows.append(self.current_row)
+                    self.current_row = []
+                elif tag == "th":
+                    self.in_th = False
+                    cell_text = "".join(self.current_cell).strip()
+                    self.current_row.append(cell_text)
+                    self.current_cell = []
+                elif tag == "td":
+                    self.in_td = False
+                    cell_text = "".join(self.current_cell).strip()
+                    self.current_row.append(cell_text)
+                    self.current_cell = []
+
+            def handle_data(self, data):
+                if self.in_th or self.in_td:
+                    self.current_cell.append(data)
+
+        parser = TableParser()
+        parser.feed(html_text)
+
+        # Return structured data
+        return {
+            "headers": parser.headers if parser.headers else None,
+            "rows": parser.rows if parser.rows else []
+        }
+
+    except Exception as exc:
+        if logger:
+            logger.warning(f"Failed to parse HTML table: {type(exc).__name__}: {exc}")
+        return None
+
+
 def normalize_dots_output(
     page_index: int, dots_json: Dict[str, Any], img_size: Tuple[int, int],
     drop_header_footer: bool, logger: logging.Logger
@@ -888,12 +974,21 @@ def normalize_dots_output(
         text = elem.get("text", "") if block_type != "image" else ""
 
         # Build extraction_response_parsed matching deepseek format
+        # extraction_response = raw model output (HTML for tables, text for others)
+        # extraction_response_parsed.data = structured data (for tables: parsed headers + rows)
+        # extraction_response_parsed.text = text content
+
         if block_type == "table" and text:
-            # Try to parse HTML table to structured data
-            parsed_payload = {"data": None, "text": text}  # Could add HTML parsing here
+            # Parse HTML table to structured data
+            table_data = _parse_html_table_to_structure(text, logger)
+            parsed_payload = {
+                "data": table_data,  # Structured: {"headers": [...], "rows": [...]}
+                "text": text  # Keep HTML for fallback/display
+            }
         elif block_type == "image":
             parsed_payload = {"data": None, "text": ""}
         else:
+            # For text blocks, no structure needed - just text
             parsed_payload = {"data": None, "text": text}
 
         blocks.append({
