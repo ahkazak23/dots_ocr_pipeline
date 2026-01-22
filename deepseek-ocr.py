@@ -1491,10 +1491,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     model, tokenizer = build_model(cfg.model, resolved_device, ds_cfg.revision, logger, backend=backend)
 
     # Determine which modes we will run.
-    modes_to_run = args.modes if args.modes else [args.mode]
+    # If --run-modes-per-page is set and --modes is not provided, run ALL modes.
+    if args.modes:
+        modes_to_run = args.modes
+    elif args.run_modes_per_page:
+        modes_to_run = list(INFERENCE_MODES.keys())
+    else:
+        modes_to_run = [args.mode]
 
-    if args.run_modes_per_page and len(modes_to_run) > 1:
-        logger.info("Running modes-per-page grid: modes=%s", modes_to_run)
+    if args.run_modes_per_page:
+        logger.info("Modes-per-page enabled; modes=%s", modes_to_run)
 
     out_dir = Path(cfg.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
