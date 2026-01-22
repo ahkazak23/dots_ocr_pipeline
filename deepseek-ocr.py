@@ -85,7 +85,14 @@ MAX_PIXEL_AREA = 12_000_000
 # Keep DPI sane; increase selectively only when needed.
 DEFAULT_DPI = 200
 
-DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR.Extract everything"
+DEFAULT_PROMPT_EXTRACT_ALL = (
+    "<image>\n"
+    "<|grounding|>Extract the full document content in reading order. "
+    "1) Output grounded blocks using <|ref|>...</|ref|> and <|det|>...</|det|>. "
+    "2) Do not omit any text. "
+    "3) For tables: output as HTML <table>...</table> inside the corresponding block. "
+    "4) Preserve numbers, units, and punctuation exactly. No paraphrasing."
+)
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
@@ -174,7 +181,7 @@ INFERENCE_MODES = {
 INFERENCE_CONFIG = {
     "base_size": 1024,
     "image_size": 768,
-    "crop_mode": True,
+    "crop_mode": False,
     "test_compress": False,
     # Deterministic generation / stable outputs
     "do_sample": False,
@@ -479,6 +486,8 @@ def render_pdf_to_images(
         page = doc[page_index]
         t0 = time.time()
 
+        pixmap: Optional[fitz.Pixmap] = None
+
         try:
             rotation = int(page.rotation or 0) % 360
         except Exception:
@@ -545,6 +554,9 @@ def render_pdf_to_images(
                     zoom=zoom,
             ):
                 pixmap = _render(page, rotation)
+
+        if pixmap is None:
+            raise RuntimeError("Failed to render PDF page to pixmap")
 
         mode = "RGB" if pixmap.n < 4 else "RGBA"
         with _PerfTimer(
@@ -1411,6 +1423,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Inference mode with optimized settings (extract_all is default)",
     )
     parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=list(INFERENCE_MODES.keys()),
+        default=None,
+        help="Run multiple modes (space-separated). Overrides --mode when used.",
+    )
+    parser.add_argument(
+        "--run-modes-per-page",
+        action="store_true",
+        default=False,
+        help="If set, run each selected mode for each selected page and save into per-mode output folders.",
+    )
+    parser.add_argument(
         "--prompt",
         default=None,
         help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
@@ -1465,44 +1490,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     model, tokenizer = build_model(cfg.model, resolved_device, ds_cfg.revision, logger, backend=backend)
 
-    inference_config = INFERENCE_MODES.get(args.mode, INFERENCE_MODES["extract_all"]).copy()
+    # Determine which modes we will run.
+    modes_to_run = args.modes if args.modes else [args.mode]
 
-    if args.prompt is not None:
-        inference_config["prompt"] = args.prompt
-        logger.info("Prompt: custom (--prompt)")
-    else:
-        logger.info("Prompt: mode default (%s)", args.mode)
-
-    if args.test_compress:
-        inference_config["test_compress"] = True
-        logger.info("test_compress enabled")
-
-    if args.base_size:
-        inference_config["base_size"] = args.base_size
-        logger.info("base_size overridden to %d", args.base_size)
-    if args.image_size:
-        inference_config["image_size"] = args.image_size
-        logger.info("image_size overridden to %d", args.image_size)
-    if args.max_new_tokens:
-        inference_config["max_new_tokens"] = args.max_new_tokens
-        logger.info("max_new_tokens set to %d", args.max_new_tokens)
-
-    if cfg.disable_fallbacks:
-        logger.info("Crop mode fallback: disabled")
-    else:
-        logger.info("Crop mode fallback: enabled")
-
-    logger.info(
-        "Mode: %s (base_size=%s, image_size=%s)",
-        args.mode,
-        inference_config.get("base_size"),
-        inference_config.get("image_size"),
-    )
-
-    if args.legacy_document_json:
-        logger.info("Legacy document.json output: enabled")
-    else:
-        logger.info("Legacy document.json output: disabled")
+    if args.run_modes_per_page and len(modes_to_run) > 1:
+        logger.info("Running modes-per-page grid: modes=%s", modes_to_run)
 
     out_dir = Path(cfg.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1514,46 +1506,93 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_start = time.time()
     for input_file in inputs:
-        selection_label = "all_pages"
+        base_selection_label = "all_pages"
         if args.pages:
-            selection_label = "pages_" + "-".join(map(str, args.pages))
+            base_selection_label = "pages_" + "-".join(map(str, args.pages))
         elif args.page_range:
-            selection_label = f"pages_{args.page_range}"
+            base_selection_label = f"pages_{args.page_range}"
 
-        doc_root = out_dir / input_file.stem
-        doc_root.mkdir(parents=True, exist_ok=True)
+        for mode_name in modes_to_run:
+            inference_config = INFERENCE_MODES.get(mode_name, INFERENCE_MODES["extract_all"]).copy()
 
-        logger.info("Processing document: %s (selection=%s)", input_file.name, selection_label)
+            # Allow global overrides even in multi-mode runs
+            if args.prompt is not None:
+                inference_config["prompt"] = args.prompt
+                logger.info("Prompt: custom (--prompt) [mode=%s]", mode_name)
+            else:
+                logger.info("Prompt: mode default (%s)", mode_name)
 
-        doc_json, summary = process_document(
-            model,
-            tokenizer,
-            input_file,
-            cfg,
-            output_root=doc_root,
-            selection_label=selection_label,
-            logger=logger,
-            pages=args.pages,
-            page_range=args.page_range,
-            inference_config=inference_config,
-            legacy_document_json=args.legacy_document_json,
-        )
+            if args.test_compress:
+                inference_config["test_compress"] = True
+                logger.info("test_compress enabled [mode=%s]", mode_name)
 
-        selection_dir = doc_root / selection_label
-        out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
+            if args.base_size:
+                inference_config["base_size"] = args.base_size
+                logger.info("base_size overridden to %d [mode=%s]", args.base_size, mode_name)
+            if args.image_size:
+                inference_config["image_size"] = args.image_size
+                logger.info("image_size overridden to %d [mode=%s]", args.image_size, mode_name)
+            if args.max_new_tokens:
+                inference_config["max_new_tokens"] = args.max_new_tokens
+                logger.info("max_new_tokens set to %d [mode=%s]", args.max_new_tokens, mode_name)
 
-        run_items.append(
-            {
-                "input_file": str(input_file),
-                "output_file": str(out_path),
-                "pages": summary["total_pages"],
-                "total_time_sec": summary["total_time_sec"],
-                "avg_time_per_page_sec": summary["avg_time_per_page_sec"],
-                "page_timings": summary["page_timings"],
-            }
-        )
-        grand_total_time += summary["total_time_sec"]
-        total_pages += summary["total_pages"]
+            if cfg.disable_fallbacks:
+                logger.info("Crop mode fallback: disabled")
+            else:
+                logger.info("Crop mode fallback: enabled")
+
+            logger.info(
+                "Mode: %s (base_size=%s, image_size=%s)",
+                mode_name,
+                inference_config.get("base_size"),
+                inference_config.get("image_size"),
+            )
+
+            if args.legacy_document_json:
+                logger.info("Legacy document.json output: enabled")
+            else:
+                logger.info("Legacy document.json output: disabled")
+
+            # Separate results by mode when running a grid.
+            selection_label = base_selection_label
+            if args.run_modes_per_page and len(modes_to_run) > 1:
+                selection_label = f"{base_selection_label}__mode_{mode_name}"
+
+            doc_root = out_dir / input_file.stem
+            doc_root.mkdir(parents=True, exist_ok=True)
+
+            logger.info("Processing document: %s (selection=%s)", input_file.name, selection_label)
+
+            doc_json, summary = process_document(
+                model,
+                tokenizer,
+                input_file,
+                cfg,
+                output_root=doc_root,
+                selection_label=selection_label,
+                logger=logger,
+                pages=args.pages,
+                page_range=args.page_range,
+                inference_config=inference_config,
+                legacy_document_json=args.legacy_document_json,
+            )
+
+            selection_dir = doc_root / selection_label
+            out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
+
+            run_items.append(
+                {
+                    "input_file": str(input_file),
+                    "output_file": str(out_path),
+                    "mode": mode_name,
+                    "pages": summary["total_pages"],
+                    "total_time_sec": summary["total_time_sec"],
+                    "avg_time_per_page_sec": summary["avg_time_per_page_sec"],
+                    "page_timings": summary["page_timings"],
+                }
+            )
+            grand_total_time += summary["total_time_sec"]
+            total_pages += summary["total_pages"]
 
     run_total_time = time.time() - run_start
     summary_path = write_run_summary(
