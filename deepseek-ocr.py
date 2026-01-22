@@ -209,6 +209,117 @@ def _setup_logger(log_level: str = "INFO") -> logging.Logger:
     return logger
 
 
+# -------------------------
+# Perf / debug log helpers
+# -------------------------
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _fmt_bytes(num: Optional[int]) -> str:
+    if num is None:
+        return "n/a"
+    try:
+        n = float(num)
+    except Exception:
+        return str(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            return f"{n:.2f}{unit}"
+        n /= 1024.0
+    return f"{n:.2f}PB"
+
+
+def _cuda_mem_snapshot() -> Dict[str, Any]:
+    """Return a small CUDA memory snapshot (safe on CPU-only)."""
+    if not torch.cuda.is_available():
+        return {"cuda": False}
+    try:
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        return {
+            "cuda": True,
+            "device": idx,
+            "name": props.name,
+            "total": int(props.total_memory),
+            "allocated": int(torch.cuda.memory_allocated(idx)),
+            "reserved": int(torch.cuda.memory_reserved(idx)),
+            "max_allocated": int(torch.cuda.max_memory_allocated(idx)),
+            "max_reserved": int(torch.cuda.max_memory_reserved(idx)),
+        }
+    except Exception as exc:
+        return {"cuda": True, "error": f"{type(exc).__name__}: {exc}"}
+
+
+class _PerfTimer:
+    def __init__(self, logger: logging.Logger, scope: str, page_id: str = "", **fields: Any):
+        self.logger = logger
+        self.scope = scope
+        self.page_id = page_id
+        self.fields = fields
+        self.t0 = time.time()
+        self.cuda_before = _cuda_mem_snapshot()
+
+    def __enter__(self):
+        prefix = f"[{self.page_id}] " if self.page_id else ""
+        self.logger.debug("%s[PERF][START] %s fields=%s cuda_before=%s", prefix, self.scope, self.fields, _summarize_cuda(self.cuda_before))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.time() - self.t0
+        cuda_after = _cuda_mem_snapshot()
+        prefix = f"[{self.page_id}] " if self.page_id else ""
+        base = {
+            "scope": self.scope,
+            "ms": int(dt * 1000),
+            "fields": self.fields,
+            "cuda_before": _summarize_cuda(self.cuda_before),
+            "cuda_after": _summarize_cuda(cuda_after),
+        }
+        if exc_type is not None:
+            base["error"] = f"{exc_type.__name__}: {exc}"
+            self.logger.error("%s[PERF][END][ERROR] %s", prefix, base)
+        else:
+            # Emit INFO if it looks slow; otherwise DEBUG.
+            if dt >= 5.0:
+                self.logger.info("%s[PERF][END][SLOW] %s", prefix, base)
+            else:
+                self.logger.debug("%s[PERF][END] %s", prefix, base)
+        return False
+
+
+def _summarize_cuda(snap: Dict[str, Any]) -> Dict[str, Any]:
+    if not snap.get("cuda"):
+        return {"cuda": False}
+    if "error" in snap:
+        return {"cuda": True, "error": snap["error"]}
+    return {
+        "cuda": True,
+        "device": snap.get("device"),
+        "name": snap.get("name"),
+        "allocated": _fmt_bytes(snap.get("allocated")),
+        "reserved": _fmt_bytes(snap.get("reserved")),
+        "max_allocated": _fmt_bytes(snap.get("max_allocated")),
+        "max_reserved": _fmt_bytes(snap.get("max_reserved")),
+        "total": _fmt_bytes(snap.get("total")),
+    }
+
+
+def _image_meta(path: Path) -> Dict[str, Any]:
+    """Read minimal image metadata; avoids loading full pixel tensor."""
+    try:
+        with Image.open(path) as im:
+            return {
+                "path": str(path),
+                "format": im.format,
+                "mode": im.mode,
+                "size": [im.size[0], im.size[1]],
+            }
+    except Exception as exc:
+        return {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+
+
 # Backend
 
 class Backend(str, enum.Enum):
@@ -346,18 +457,22 @@ def render_pdf_to_images(
         except Exception:
             rotation = None
 
-        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+        with _PerfTimer(logger, "pdf.get_pixmap", page_id=f"P{page_index+1:03d}", dpi=dpi, rotation=rotation, zoom=zoom):
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+
         mode = "RGB" if pixmap.n < 4 else "RGBA"
-        img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
+        with _PerfTimer(logger, "pixmap.to_pil", page_id=f"P{page_index+1:03d}", pix_w=pixmap.width, pix_h=pixmap.height, pix_n=pixmap.n, mode=mode):
+            img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
 
         if max(img.size) > MAX_IMAGE_DIMENSION:
             original_size = img.size
             scale = MAX_IMAGE_DIMENSION / max(img.size)
             new_size = (int(img.width * scale), int(img.height * scale))
             resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
-            img = img.resize(new_size, resample)
+            with _PerfTimer(logger, "pil.resize", page_id=f"P{page_index+1:03d}", original=list(original_size), new=list(new_size), scale=round(scale, 4)):
+                img = img.resize(new_size, resample)
             logger.debug(
                 "[RENDER][P%03d] resized from %s to %s (max_dim=%d)",
                 page_index + 1,
@@ -367,7 +482,8 @@ def render_pdf_to_images(
             )
 
         img_path = tmp_dir / f"page_{page_index}.png"
-        img.save(img_path)
+        with _PerfTimer(logger, "pil.save", page_id=f"P{page_index+1:03d}", out=str(img_path)):
+            img.save(img_path)
         image_paths.append(img_path)
 
         elapsed_sec = time.time() - t0
@@ -543,55 +659,58 @@ def parse_grounded_stdout(
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
     """
-    img = Image.open(image_path).convert("RGB")
+    with _PerfTimer(logger, "parse.open_image", page_id=image_path.stem, image=image_path.name, captured_chars=len(captured)):
+        img = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     resolution = [img_w, img_h]
 
-    matches = list(REF_RE.finditer(captured))
+    with _PerfTimer(logger, "parse.find_refs", page_id=image_path.stem, img_w=img_w, img_h=img_h):
+        matches = list(REF_RE.finditer(captured))
+
     blocks: List[Dict[str, Any]] = []
     bbox_parse_failures = 0
 
-    for i, match in enumerate(matches):
-        label = match.group("label").strip()
-        det_text = match.group("det").strip()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(captured)
-        content = captured[start:end].strip()
+    with _PerfTimer(logger, "parse.blocks", page_id=image_path.stem, match_count=len(matches)):
+        for i, match in enumerate(matches):
+            label = match.group("label").strip()
+            det_text = match.group("det").strip()
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(captured)
+            content = captured[start:end].strip()
 
-        try:
-            det_coords = _parse_det(det_text)
-            bbox = _det_to_bbox_normalized(det_coords, img_w, img_h)
-        except Exception as exc:
-            bbox = [0.0, 0.0, 0.0, 0.0]
-            bbox_parse_failures += 1
-            logger.warning(
-                "bbox parse failed for block %d on %s: %s: %s",
-                len(blocks),
-                image_path.name,
-                type(exc).__name__,
-                exc,
-            )
+            try:
+                det_coords = _parse_det(det_text)
+                bbox = _det_to_bbox_normalized(det_coords, img_w, img_h)
+            except Exception as exc:
+                bbox = [0.0, 0.0, 0.0, 0.0]
+                bbox_parse_failures += 1
+                logger.warning(
+                    "bbox parse failed for block %d on %s: %s: %s",
+                    len(blocks),
+                    image_path.name,
+                    type(exc).__name__,
+                    exc,
+                )
 
-        block_type = LABEL_TO_TYPE.get(label, "paragraph")
+            block_type = LABEL_TO_TYPE.get(label, "paragraph")
 
-        if block_type == "table":
-            table_data = try_parse_markdown_table(content)
-            parsed_payload = {"data": table_data, "text": normalize_text(content)}
-        elif block_type == "image":
-            parsed_payload = {"data": None, "text": ""}
-        else:
-            parsed_payload = {"data": None, "text": normalize_text(content)}
+            if block_type == "table":
+                table_data = try_parse_markdown_table(content)
+                parsed_payload = {"data": table_data, "text": normalize_text(content)}
+            elif block_type == "image":
+                parsed_payload = {"data": None, "text": ""}
+            else:
+                parsed_payload = {"data": None, "text": normalize_text(content)}
 
-        # BBox overlay expects legacy blocks with id/order.
-        legacy_block = {
-            "id": f"blk_{len(blocks) + 1}",
-            "type": block_type,
-            "order": len(blocks),
-            "bbox": bbox,
-            "extraction_response": content,
-            "extraction_response_parsed": parsed_payload,
-        }
-        blocks.append(legacy_block)
+            legacy_block = {
+                "id": f"blk_{len(blocks) + 1}",
+                "type": block_type,
+                "order": len(blocks),
+                "bbox": bbox,
+                "extraction_response": content,
+                "extraction_response_parsed": parsed_payload,
+            }
+            blocks.append(legacy_block)
 
     parse_diag = {
         "img_w": img_w,
@@ -623,6 +742,7 @@ def _run_inference(
     Returns:
         (captured_text, inference_time_sec)
     """
+    logger = logging.getLogger("deepseek_ocr")
     t0 = time.time()
     out_buf = StringIO()
     err_buf = StringIO()
@@ -630,21 +750,30 @@ def _run_inference(
     prompt = infer_config.get("prompt", PROMPT)
     config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
 
+    # Very verbose config dump (masked prompt preview)
+    meta = {
+        "image": _image_meta(image_path),
+        "prompt_preview": (prompt[:120] + "…") if isinstance(prompt, str) and len(prompt) > 120 else prompt,
+        "infer_kwargs": config_for_infer,
+    }
+    logger.info("[INFER][BEGIN] %s", meta)
+
     res = None
     exception_msg = None
-    with torch.inference_mode():
-        try:
-            with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                res = model.infer(
-                    tokenizer,
-                    prompt=prompt,
-                    image_file=str(image_path),
-                    output_path=str(image_path.parent),
-                    save_results=False,
-                    **config_for_infer,
-                )
-        except Exception as exc:
-            exception_msg = f"{type(exc).__name__}: {exc}"
+    with _PerfTimer(logger, "hf.model.infer", page_id=image_path.stem, **{"image": str(image_path)}):
+        with torch.inference_mode():
+            try:
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    res = model.infer(
+                        tokenizer,
+                        prompt=prompt,
+                        image_file=str(image_path),
+                        output_path=str(image_path.parent),
+                        save_results=False,
+                        **config_for_infer,
+                    )
+            except Exception as exc:
+                exception_msg = f"{type(exc).__name__}: {exc}"
 
     infer_time = time.time() - t0
 
@@ -656,160 +785,32 @@ def _run_inference(
     elif err_buf.getvalue().strip():
         captured = err_buf.getvalue().strip()
 
+    # Capture sizes and short tails to debug hangs / huge outputs
+    stdout_val = out_buf.getvalue()
+    stderr_val = err_buf.getvalue()
+    logger.info(
+        "[INFER][END] image=%s time=%.3fs res_type=%s captured_chars=%d stdout_chars=%d stderr_chars=%d exception=%s",
+        image_path.name,
+        infer_time,
+        type(res).__name__ if res is not None else None,
+        len(captured),
+        len(stdout_val),
+        len(stderr_val),
+        bool(exception_msg),
+    )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        if stdout_val.strip():
+            logger.debug("[INFER][STDOUT][TAIL] %r", stdout_val[-2000:])
+        if stderr_val.strip():
+            logger.debug("[INFER][STDERR][TAIL] %r", stderr_val[-2000:])
+
     if exception_msg:
-        logger = logging.getLogger("deepseek_ocr")
         logger.error("Inference exception: %s", exception_msg)
         if not captured:
             captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
 
     return captured, infer_time
-
-
-def _run_ollama_inference(
-    image_path: Path,
-    logger: logging.Logger,
-    prompt: str,
-    model_name: str = "deepseek-ocr",
-) -> Tuple[str, float]:
-    """Run inference via Ollama HTTP API with an image."""
-    t0 = time.time()
-    try:
-        img_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-
-        payload = {"model": model_name, "prompt": prompt, "images": [img_b64], "stream": False}
-        data = json.dumps(payload).encode("utf-8")
-
-        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        req = urllib.request.Request(
-            url=f"{host}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            resp_data = resp.read().decode("utf-8")
-            try:
-                obj = json.loads(resp_data)
-                captured = obj.get("response", "")
-            except Exception:
-                captured = resp_data
-
-        infer_time = time.time() - t0
-        return str(captured).strip(), infer_time
-
-    except urllib.error.HTTPError as exc:
-        infer_time = time.time() - t0
-        logger.error("Ollama HTTP error %s: %s", exc.code, exc.reason)
-        return "", infer_time
-    except urllib.error.URLError as exc:
-        infer_time = time.time() - t0
-        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        logger.error("Ollama not reachable at %s: %s", host, exc.reason)
-        logger.error("Ensure 'ollama serve' is running and port 11434 is free.")
-        return "", infer_time
-    except Exception as exc:
-        infer_time = time.time() - t0
-        logger.error("Ollama inference failed: %s: %s", type(exc).__name__, exc)
-        return "", infer_time
-
-
-def run_page_ocr(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    infer_config: Dict[str, Any],
-    logger: logging.Logger,
-    page_id: str = "",
-    disable_fallbacks: bool = False,
-    backend: Backend = Backend.HUGGINGFACE,
-) -> Tuple[Dict[str, Any], float, str, List[int]]:
-    """Run OCR on a single rendered page image.
-
-    Returns:
-        (page_ocr, inference_time_sec, attempt_used, resolution)
-    """
-    if backend == Backend.OLLAMA:
-        logger.info("[%s] Inference (ollama)", page_id)
-        prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
-        captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
-        if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
-            return page_ocr, infer_time, "ollama", resolution
-        logger.warning("[%s] No grounding tags detected", page_id)
-        img = Image.open(image_path).convert("RGB")
-        resolution = [img.size[0], img.size[1]]
-        return {"ocr": {"blocks": []}}, infer_time, "none", resolution
-
-    logger.info("[%s] Inference (base)", page_id)
-    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config)
-
-    logger.debug("[%s] Base attempt captured %d chars", page_id, len(captured))
-    if captured:
-        preview = captured[:200] if len(captured) > 200 else captured
-        logger.debug("[%s] Base output preview: %r", page_id, preview)
-    else:
-        logger.warning("[%s] Base attempt produced empty output", page_id)
-
-    if _has_grounding_tags(captured):
-        logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
-        return page_ocr, time_base, "base", resolution
-
-    if not disable_fallbacks:
-        logger.info("[%s] Inference (crop_mode fallback)", page_id)
-        crop_config = dict(infer_config)
-        crop_config["crop_mode"] = True
-        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config)
-
-        logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
-        if captured_crop:
-            preview_crop = captured_crop[:200] if len(captured_crop) > 200 else captured_crop
-            logger.debug("[%s] Crop output preview: %r", page_id, preview_crop)
-        else:
-            logger.warning("[%s] Crop attempt produced empty output", page_id)
-
-        if _has_grounding_tags(captured_crop):
-            logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger)
-            return page_ocr, time_base + time_crop, "crop_mode", resolution
-
-        total_time = time_base + time_crop
-        logger.warning("[%s] No grounding tags detected after all attempts", page_id)
-        img = Image.open(image_path).convert("RGB")
-        resolution = [img.size[0], img.size[1]]
-        return {"ocr": {"blocks": []}}, total_time, "none", resolution
-
-    logger.warning("[%s] Base attempt failed; fallbacks disabled", page_id)
-    img = Image.open(image_path).convert("RGB")
-    resolution = [img.size[0], img.size[1]]
-    return {"ocr": {"blocks": []}}, time_base, "none", resolution
-
-
-def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path: Path) -> None:
-    """Draw bounding boxes on page image and save."""
-    from PIL import ImageDraw
-
-    img = Image.open(page_img_path).convert("RGB")
-    img_w, img_h = img.size
-    draw = ImageDraw.Draw(img)
-    for blk in blocks:
-        bbox = blk.get("bbox")
-        if not (isinstance(bbox, list) and len(bbox) == 4):
-            continue
-        norm_x, norm_y, norm_w, norm_h = bbox
-        x = int(norm_x * img_w)
-        y = int(norm_y * img_h)
-        w = int(norm_w * img_w)
-        h = int(norm_h * img_h)
-        draw.rectangle([x, y, x + w, y + h], outline="red", width=2)
-
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(dest_path)
-
-
-def _copy_image(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    Image.open(src).convert("RGB").save(dst)
 
 
 def process_document(
@@ -847,9 +848,10 @@ def process_document(
             pdf_doc.close()
 
             selected_indices = parse_page_selection(pages, page_range, total_pages)
-            page_image_paths = render_pdf_to_images(
-                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
-            )
+            with _PerfTimer(logger, "pdf.render_selected", page_id=input_path.stem, pages=len(selected_indices), dpi=cfg.dpi):
+                page_image_paths = render_pdf_to_images(
+                    input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
+                )
         else:
             page_image_paths = [input_path]
             selected_indices = parse_page_selection(pages, page_range, len(page_image_paths))
@@ -870,29 +872,36 @@ def process_document(
 
             page_id = f"{input_path.stem}|P{page_index + 1:03d}"
 
+            logger.info(
+                "[%s] Page start: image=%s meta=%s", page_id, page_path.name, _image_meta(page_path)
+            )
+
             if cfg.debug_keep_renders:
-                try:
-                    _copy_image(page_path, page_dir / "render.png")
-                except Exception as exc:
-                    logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
+                with _PerfTimer(logger, "page.persist_render", page_id=page_id):
+                    try:
+                        _copy_image(page_path, page_dir / "render.png")
+                    except Exception as exc:
+                        logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
 
             try:
-                page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
-                    model=model,
-                    tokenizer=tokenizer,
-                    image_path=page_path,
-                    infer_config=infer_config,
-                    logger=logger,
-                    page_id=page_id,
-                    disable_fallbacks=cfg.disable_fallbacks,
-                    backend=cfg.backend,
-                )
+                with _PerfTimer(logger, "page.run_page_ocr", page_id=page_id, backend=str(cfg.backend)):
+                    page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image_path=page_path,
+                        infer_config=infer_config,
+                        logger=logger,
+                        page_id=page_id,
+                        disable_fallbacks=cfg.disable_fallbacks,
+                        backend=cfg.backend,
+                    )
 
                 if cfg.save_bbox_overlay:
-                    try:
-                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
-                    except Exception as exc:
-                        logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
+                    with _PerfTimer(logger, "page.save_bbox_overlay", page_id=page_id):
+                        try:
+                            save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
+                        except Exception as exc:
+                            logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -926,9 +935,18 @@ def process_document(
                     warnings=page_warnings if page_warnings else None,
                 )
 
-                page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                logger.debug("[%s] wrote %s", page_id, page_json_path.name)
+                with _PerfTimer(logger, "page.write_json", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
+                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                logger.info(
+                    "[%s] Page done: attempt=%s blocks=%d infer_time=%.3fs resolution=%s",
+                    page_id,
+                    attempt_used,
+                    len(spec_blocks),
+                    infer_time,
+                    resolution,
+                )
 
                 page_payload = {
                     "meta": {
@@ -967,8 +985,9 @@ def process_document(
                     blocks=[],
                     warnings=error_warnings,
                 )
-                page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                with _PerfTimer(logger, "page.write_json.error", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
+                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 page_payload = {
                     "meta": {
