@@ -450,8 +450,20 @@ def render_pdf_to_images(
 
     Key behaviors:
       - Honors PDF page rotation (very common for landscape scans)
+      - Avoids double-rotating: some PDFs have rotation metadata but content is already upright
       - Caps by pixel area (~12MP) to preserve table readability
+
+    Strategy:
+      - If rotation is 0/180: just render normally with that rotation.
+      - If rotation is 90/270: render two candidates (apply rotation vs. ignore rotation)
+        and pick the candidate whose aspect ratio matches the *expected upright view*.
+        This prevents the regression where portrait pages become landscape.
     """
+
+    def _render(page_obj: fitz.Page, rot: int) -> fitz.Pixmap:
+        mat = fitz.Matrix(zoom, zoom).prerotate(rot)
+        return page_obj.get_pixmap(matrix=mat, alpha=False)
+
     doc = fitz.open(pdf_path)
     image_paths: List[Path] = []
 
@@ -469,23 +481,72 @@ def render_pdf_to_images(
         page = doc[page_index]
         t0 = time.time()
 
-        # Non-negotiable: honor PDF rotation.
         try:
-            rotation = int(page.rotation or 0)
+            rotation = int(page.rotation or 0) % 360
         except Exception:
             rotation = 0
 
-        matrix = fitz.Matrix(zoom, zoom).prerotate(rotation)
+        chosen_rot = rotation
+        chosen_reason = "apply_pdf_rotation"
 
-        with _PerfTimer(
-                logger,
-                "pdf.get_pixmap",
-                page_id=f"P{page_index + 1:03d}",
-                dpi=dpi,
-                rotation=rotation,
-                zoom=zoom,
-        ):
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+        # For 90/270, PDF rotation is often correct… but sometimes the content is already upright.
+        # We'll render both and pick the one that yields portrait-like output (more OCR-friendly).
+        if rotation in (90, 270):
+            with _PerfTimer(logger, "pdf.get_pixmap.candidates", page_id=f"P{page_index + 1:03d}", dpi=dpi, pdf_rotation=rotation, zoom=zoom):
+                pix_apply = _render(page, rotation)
+                pix_ignore = _render(page, 0)
+
+            # Heuristic: prefer portrait (h>=w). Most documents/table pages are portrait.
+            # If both are portrait/landscape, prefer the one closer to portrait.
+            apply_portrait = pix_apply.height >= pix_apply.width
+            ignore_portrait = pix_ignore.height >= pix_ignore.width
+
+            if apply_portrait and not ignore_portrait:
+                chosen_pix = pix_apply
+                chosen_rot = rotation
+                chosen_reason = "rotation_fixed_sideways"
+            elif ignore_portrait and not apply_portrait:
+                chosen_pix = pix_ignore
+                chosen_rot = 0
+                chosen_reason = "rotation_metadata_ignored_double_rotate"
+            else:
+                # Tie-breaker: choose the candidate with larger height/width ratio
+                ratio_apply = pix_apply.height / max(1, pix_apply.width)
+                ratio_ignore = pix_ignore.height / max(1, pix_ignore.width)
+                if ratio_apply >= ratio_ignore:
+                    chosen_pix = pix_apply
+                    chosen_rot = rotation
+                    chosen_reason = "tie_breaker_apply"
+                else:
+                    chosen_pix = pix_ignore
+                    chosen_rot = 0
+                    chosen_reason = "tie_breaker_ignore"
+
+            pixmap = chosen_pix
+
+            logger.info(
+                "[RENDER][P%03d] pdf_rot=%d candidate_apply=%dx%d candidate_ignore=%dx%d chosen_rot=%d reason=%s",
+                page_index + 1,
+                rotation,
+                pix_apply.width,
+                pix_apply.height,
+                pix_ignore.width,
+                pix_ignore.height,
+                chosen_rot,
+                chosen_reason,
+            )
+
+        else:
+            # 0 or 180: just apply rotation.
+            with _PerfTimer(
+                    logger,
+                    "pdf.get_pixmap",
+                    page_id=f"P{page_index + 1:03d}",
+                    dpi=dpi,
+                    rotation=rotation,
+                    zoom=zoom,
+            ):
+                pixmap = _render(page, rotation)
 
         mode = "RGB" if pixmap.n < 4 else "RGBA"
         with _PerfTimer(
@@ -543,7 +604,7 @@ def render_pdf_to_images(
             pixmap.width,
             pixmap.height,
             getattr(page, "rotation", None),
-            rotation,
+            chosen_rot,
             elapsed_sec,
         )
 
