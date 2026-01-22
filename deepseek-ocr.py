@@ -439,7 +439,6 @@ def render_pdf_to_images(
     image_paths: List[Path] = []
 
     zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
 
     total_pages = len(doc)
     if page_indices is not None:
@@ -452,16 +451,37 @@ def render_pdf_to_images(
     for page_index in pages_to_render:
         page = doc[page_index]
         t0 = time.time()
-        try:
-            rotation = int(page.rotation)
-        except Exception:
-            rotation = None
 
-        with _PerfTimer(logger, "pdf.get_pixmap", page_id=f"P{page_index+1:03d}", dpi=dpi, rotation=rotation, zoom=zoom):
+        # IMPORTANT: Many PDFs store pages rotated (e.g., 90/270). If we ignore this,
+        # the model sees sideways text and may fail or take far longer.
+        try:
+            rotation = int(page.rotation or 0)
+        except Exception:
+            rotation = 0
+
+        # Apply rotation to the render matrix so the output image is upright.
+        matrix = fitz.Matrix(zoom, zoom).prerotate(rotation)
+
+        with _PerfTimer(
+            logger,
+            "pdf.get_pixmap",
+            page_id=f"P{page_index+1:03d}",
+            dpi=dpi,
+            rotation=rotation,
+            zoom=zoom,
+        ):
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
 
         mode = "RGB" if pixmap.n < 4 else "RGBA"
-        with _PerfTimer(logger, "pixmap.to_pil", page_id=f"P{page_index+1:03d}", pix_w=pixmap.width, pix_h=pixmap.height, pix_n=pixmap.n, mode=mode):
+        with _PerfTimer(
+            logger,
+            "pixmap.to_pil",
+            page_id=f"P{page_index+1:03d}",
+            pix_w=pixmap.width,
+            pix_h=pixmap.height,
+            pix_n=pixmap.n,
+            mode=mode,
+        ):
             img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -471,7 +491,14 @@ def render_pdf_to_images(
             scale = MAX_IMAGE_DIMENSION / max(img.size)
             new_size = (int(img.width * scale), int(img.height * scale))
             resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
-            with _PerfTimer(logger, "pil.resize", page_id=f"P{page_index+1:03d}", original=list(original_size), new=list(new_size), scale=round(scale, 4)):
+            with _PerfTimer(
+                logger,
+                "pil.resize",
+                page_id=f"P{page_index+1:03d}",
+                original=list(original_size),
+                new=list(new_size),
+                scale=round(scale, 4),
+            ):
                 img = img.resize(new_size, resample)
             logger.debug(
                 "[RENDER][P%03d] resized from %s to %s (max_dim=%d)",
@@ -488,11 +515,12 @@ def render_pdf_to_images(
 
         elapsed_sec = time.time() - t0
         logger.info(
-            "[RENDER][P%03d] dpi=%d size=%dx%d rot=%s time=%.3fs",
+            "[RENDER][P%03d] dpi=%d size=%dx%d rot=%s applied_rot=%s time=%.3fs",
             page_index + 1,
             dpi,
             pixmap.width,
             pixmap.height,
+            getattr(page, "rotation", None),
             rotation,
             elapsed_sec,
         )
