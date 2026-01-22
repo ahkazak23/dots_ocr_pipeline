@@ -85,9 +85,7 @@ MAX_PIXEL_AREA = 12_000_000
 # Keep DPI sane; increase selectively only when needed.
 DEFAULT_DPI = 200
 
-DEFAULT_PROMPT_EXTRACT_ALL = (
-    "<image>\n<|grounding|>Convert the document to markdown. Do not omit any rows or columns from tables. Preserve full table structure."
-)
+DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR.Extract everything"
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
