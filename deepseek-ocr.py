@@ -813,354 +813,154 @@ def _run_inference(
     return captured, infer_time
 
 
-def process_document(
+def _run_ollama_inference(
+    image_path: Path,
+    logger: logging.Logger,
+    prompt: str,
+    model_name: str = "deepseek-ocr",
+) -> Tuple[str, float]:
+    """Run inference via Ollama HTTP API with an image."""
+    t0 = time.time()
+    try:
+        img_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+        payload = {"model": model_name, "prompt": prompt, "images": [img_b64], "stream": False}
+        data = json.dumps(payload).encode("utf-8")
+
+        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        req = urllib.request.Request(
+            url=f"{host}/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            resp_data = resp.read().decode("utf-8")
+            try:
+                obj = json.loads(resp_data)
+                captured = obj.get("response", "")
+            except Exception:
+                captured = resp_data
+
+        infer_time = time.time() - t0
+        return str(captured).strip(), infer_time
+
+    except urllib.error.HTTPError as exc:
+        infer_time = time.time() - t0
+        logger.error("Ollama HTTP error %s: %s", exc.code, exc.reason)
+        return "", infer_time
+    except urllib.error.URLError as exc:
+        infer_time = time.time() - t0
+        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        logger.error("Ollama not reachable at %s: %s", host, exc.reason)
+        logger.error("Ensure 'ollama serve' is running and port 11434 is free.")
+        return "", infer_time
+    except Exception as exc:
+        infer_time = time.time() - t0
+        logger.error("Ollama inference failed: %s: %s", type(exc).__name__, exc)
+        return "", infer_time
+
+
+def run_page_ocr(
     model: Any,
     tokenizer: Any,
-    input_path: Path,
-    cfg: Config,
-    output_root: Path,
-    selection_label: str,
+    image_path: Path,
+    infer_config: Dict[str, Any],
     logger: logging.Logger,
-    pages: Optional[List[int]] = None,
-    page_range: Optional[str] = None,
+    page_id: str = "",
+    disable_fallbacks: bool = False,
     backend: Backend = Backend.HUGGINGFACE,
-    inference_config: Optional[Dict[str, Any]] = None,
-    legacy_document_json: bool = False,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Process one input document and write per-page outputs.
+) -> Tuple[Dict[str, Any], float, str, List[int]]:
+    """Run OCR on a single page image.
 
     Returns:
-        (legacy_doc_json, metrics_summary)
+        (page_ocr, inference_time_sec, attempt_used, resolution)
     """
-    warnings_list: List[str] = []
-    input_type = "pdf" if is_pdf(input_path) else "image"
-    selection_dir = output_root / selection_label
-    selection_dir.mkdir(parents=True, exist_ok=True)
+    if backend == Backend.OLLAMA:
+        logger.info("[%s] Inference (ollama)", page_id)
+        prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
+        captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
+        if _has_grounding_tags(captured):
+            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
+            return page_ocr, infer_time, "ollama", resolution
+        logger.warning("[%s] No grounding tags detected", page_id)
+        img = Image.open(image_path).convert("RGB")
+        resolution = [img.size[0], img.size[1]]
+        return {"ocr": {"blocks": []}}, infer_time, "none", resolution
 
-    infer_config = inference_config if inference_config is not None else INFERENCE_CONFIG
+    logger.info("[%s] Inference (base)", page_id)
+    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config)
 
-    with tempfile.TemporaryDirectory() as tmpdir_str:
-        tmp_dir = Path(tmpdir_str)
+    logger.debug("[%s] Base attempt captured %d chars", page_id, len(captured))
+    if captured:
+        preview = captured[:200] if len(captured) > 200 else captured
+        logger.debug("[%s] Base output preview: %r", page_id, preview)
+    else:
+        logger.warning("[%s] Base attempt produced empty output", page_id)
 
-        if input_type == "pdf":
-            pdf_doc = fitz.open(input_path)
-            total_pages = len(pdf_doc)
-            pdf_doc.close()
+    if _has_grounding_tags(captured):
+        logger.info("[%s] Inference succeeded (base)", page_id)
+        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
+        return page_ocr, time_base, "base", resolution
 
-            selected_indices = parse_page_selection(pages, page_range, total_pages)
-            with _PerfTimer(logger, "pdf.render_selected", page_id=input_path.stem, pages=len(selected_indices), dpi=cfg.dpi):
-                page_image_paths = render_pdf_to_images(
-                    input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
-                )
+    if not disable_fallbacks:
+        logger.info("[%s] Inference (crop_mode fallback)", page_id)
+        crop_config = dict(infer_config)
+        crop_config["crop_mode"] = True
+        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config)
+
+        logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
+        if captured_crop:
+            preview_crop = captured_crop[:200] if len(captured_crop) > 200 else captured_crop
+            logger.debug("[%s] Crop output preview: %r", page_id, preview_crop)
         else:
-            page_image_paths = [input_path]
-            selected_indices = parse_page_selection(pages, page_range, len(page_image_paths))
+            logger.warning("[%s] Crop attempt produced empty output", page_id)
 
-        pages_out: List[Dict[str, Any]] = []
-        total_time = 0.0
+        if _has_grounding_tags(captured_crop):
+            logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
+            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger)
+            return page_ocr, time_base + time_crop, "crop_mode", resolution
 
-        if input_type == "pdf":
-            page_index_to_position = {idx: pos for pos, idx in enumerate(selected_indices)}
-        else:
-            page_index_to_position = {0: 0}
+        total_time = time_base + time_crop
+        logger.warning("[%s] No grounding tags detected after all attempts", page_id)
+        img = Image.open(image_path).convert("RGB")
+        resolution = [img.size[0], img.size[1]]
+        return {"ocr": {"blocks": []}}, total_time, "none", resolution
 
-        for page_index in selected_indices:
-            position = page_index_to_position[page_index]
-            page_path = page_image_paths[position]
-            page_dir = selection_dir / f"page_{page_index + 1}"
-            page_dir.mkdir(parents=True, exist_ok=True)
-
-            page_id = f"{input_path.stem}|P{page_index + 1:03d}"
-
-            logger.info(
-                "[%s] Page start: image=%s meta=%s", page_id, page_path.name, _image_meta(page_path)
-            )
-
-            if cfg.debug_keep_renders:
-                with _PerfTimer(logger, "page.persist_render", page_id=page_id):
-                    try:
-                        _copy_image(page_path, page_dir / "render.png")
-                    except Exception as exc:
-                        logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
-
-            try:
-                with _PerfTimer(logger, "page.run_page_ocr", page_id=page_id, backend=str(cfg.backend)):
-                    page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image_path=page_path,
-                        infer_config=infer_config,
-                        logger=logger,
-                        page_id=page_id,
-                        disable_fallbacks=cfg.disable_fallbacks,
-                        backend=cfg.backend,
-                    )
-
-                if cfg.save_bbox_overlay:
-                    with _PerfTimer(logger, "page.save_bbox_overlay", page_id=page_id):
-                        try:
-                            save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
-                        except Exception as exc:
-                            logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
-
-                document_id = input_path.stem
-                page_id_str = str(page_index)
-
-                spec_blocks: List[Dict[str, Any]] = []
-                for blk in page_ocr.get("ocr", {}).get("blocks", []):
-                    spec_blocks.append(
-                        {
-                            "type": blk["type"],
-                            "bbox": blk["bbox"],
-                            "extraction_origin": blk.get("extraction_origin", "deepseek-ocr"),
-                            "extraction_response": blk["extraction_response"],
-                            "extraction_response_parsed": blk["extraction_response_parsed"],
-                        }
-                    )
-
-                page_warnings: List[str] = []
-                if attempt_used == "none":
-                    page_warnings.append("OCR extraction failed - no grounding tags detected")
-                elif attempt_used == "crop_mode":
-                    page_warnings.append("Base attempt failed, used crop_mode fallback")
-
-                if len(spec_blocks) == 0 and attempt_used != "none":
-                    page_warnings.append("No blocks extracted from page")
-
-                spec_payload = build_spec_page_payload(
-                    document_id=document_id,
-                    page_id=page_id_str,
-                    resolution=resolution,
-                    blocks=spec_blocks,
-                    warnings=page_warnings if page_warnings else None,
-                )
-
-                with _PerfTimer(logger, "page.write_json", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
-                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-                logger.info(
-                    "[%s] Page done: attempt=%s blocks=%d infer_time=%.3fs resolution=%s",
-                    page_id,
-                    attempt_used,
-                    len(spec_blocks),
-                    infer_time,
-                    resolution,
-                )
-
-                page_payload = {
-                    "meta": {
-                        "model": cfg.model,
-                        "input_file": str(input_path),
-                        "input_type": input_type,
-                        "page_index": page_index,
-                        "page_label": page_index + 1,
-                        "page_id": page_id,
-                    },
-                    "page_ocr": page_ocr,
-                    "metrics": {"time_sec": round(infer_time, 4)},
-                    "diagnostics": {"attempt_used": attempt_used},
-                }
-
-                pages_out.append(page_payload)
-                total_time += infer_time
-
-            except Exception as exc:
-                warnings_list.append(f"Page {page_index} failed: {type(exc).__name__}: {exc}")
-                logger.error("[%s] page failed: %s: %s", page_id, type(exc).__name__, exc)
-
-                try:
-                    img = Image.open(page_path).convert("RGB")
-                    resolution = [img.size[0], img.size[1]]
-                except Exception:
-                    resolution = [0, 0]
-
-                document_id = input_path.stem
-                page_id_str = str(page_index)
-                error_warnings = [f"Page processing failed: {type(exc).__name__}: {exc}"]
-                spec_payload = build_spec_page_payload(
-                    document_id=document_id,
-                    page_id=page_id_str,
-                    resolution=resolution,
-                    blocks=[],
-                    warnings=error_warnings,
-                )
-                with _PerfTimer(logger, "page.write_json.error", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
-                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-                page_payload = {
-                    "meta": {
-                        "model": cfg.model,
-                        "input_file": str(input_path),
-                        "input_type": input_type,
-                        "page_index": page_index,
-                        "page_label": page_index + 1,
-                        "page_id": page_id,
-                    },
-                    "page_ocr": {"ocr": {"blocks": []}},
-                    "metrics": {"time_sec": None},
-                    "diagnostics": {"error": f"{type(exc).__name__}: {exc}"},
-                }
-                pages_out.append(page_payload)
-
-    page_count = len(pages_out)
-
-    page_timings: List[Dict[str, Any]] = []
-    for page_payload in pages_out:
-        meta = page_payload.get("meta", {})
-        metrics = page_payload.get("metrics", {})
-        diagnostics = page_payload.get("diagnostics", {})
-        ocr = page_payload.get("page_ocr", {}).get("ocr", {})
-
-        page_timings.append(
-            {
-                "page_index": meta.get("page_index"),
-                "page_label": meta.get("page_label"),
-                "time_sec": metrics.get("time_sec"),
-                "attempt_used": diagnostics.get("attempt_used"),
-                "blocks_extracted": len(ocr.get("blocks", [])),
-                "error": diagnostics.get("error"),
-            }
-        )
-
-    summary = {
-        "total_pages": page_count,
-        "total_time_sec": round(total_time, 4),
-        "avg_time_per_page_sec": round(total_time / page_count, 4) if page_count else 0.0,
-        "page_timings": page_timings,
-    }
-
-    doc_json = {
-        "meta": {
-            "model": cfg.model,
-            "input_file": str(input_path),
-            "input_type": input_type,
-            "page_count": page_count,
-            "dpi": cfg.dpi if input_type == "pdf" else None,
-            "warnings": warnings_list,
-            "output_dir": str(selection_dir),
-        },
-        "pages": pages_out,
-        "metrics_summary": summary,
-    }
-
-    if legacy_document_json:
-        out_path = selection_dir / "document.json"
-        out_path.write_text(json.dumps(doc_json, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("Legacy document.json written to %s", out_path)
-
-    return doc_json, summary
+    logger.warning("[%s] Base attempt failed; fallbacks disabled", page_id)
+    img = Image.open(image_path).convert("RGB")
+    resolution = [img.size[0], img.size[1]]
+    return {"ocr": {"blocks": []}}, time_base, "none", resolution
 
 
-def gather_inputs(input_arg: Path) -> List[Path]:
-    if input_arg.is_file():
-        return [input_arg]
-    if input_arg.is_dir():
-        candidates = []
-        for path in sorted(input_arg.rglob("*")):
-            if path.is_file() and (is_pdf(path) or is_image(path)):
-                candidates.append(path)
-        return candidates
-    raise FileNotFoundError(f"Input not found: {input_arg}")
+def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path: Path) -> None:
+    """Draw bounding boxes on page image and save."""
+    from PIL import ImageDraw
+
+    img = Image.open(page_img_path).convert("RGB")
+    img_w, img_h = img.size
+    draw = ImageDraw.Draw(img)
+    for blk in blocks:
+        bbox = blk.get("bbox")
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+        norm_x, norm_y, norm_w, norm_h = bbox
+        x = int(norm_x * img_w)
+        y = int(norm_y * img_h)
+        w = int(norm_w * img_w)
+        h = int(norm_h * img_h)
+        draw.rectangle([x, y, x + w, y + h], outline="red", width=2)
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(dest_path)
 
 
-def write_run_summary(
-    eval_dir: Path,
-    run_items: List[Dict[str, Any]],
-    total_time: float,
-    total_pages: int,
-    device: str,
-    model: str,
-) -> Path:
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    ts_filename = time.strftime("%Y%m%d_%H%M%S")
-    ts_readable = time.strftime("%Y-%m-%d %H:%M:%S")
-    out_path = eval_dir / f"deepseek_ocr_run_{ts_filename}.json"
-    payload = {
-        "model": model,
-        "device": device,
-        "run_started": ts_readable,
-        "total_documents": len(run_items),
-        "total_pages": total_pages,
-        "total_time_sec": round(total_time, 4),
-        "documents": run_items,
-    }
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out_path
+def _copy_image(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    Image.open(src).convert("RGB").save(dst)
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DeepSeek-OCR pipeline")
-    parser.add_argument("--input", required=True, help="Path to a PDF, image, or folder of files")
-    parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
-    parser.add_argument("--eval-output-dir", default="./evaluation_output", help="Directory for evaluation run summaries (default: ./evaluation_output)")
-    parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
-    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
-    parser.add_argument("--revision", default=None, help="Optional model revision")
-    parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
-    parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level")
-    parser.add_argument("--keep-renders", action="store_true", help="Persist rendered page images under page folders (recommended)")
-    parser.add_argument(
-        "--no-bbox-overlay",
-        action="store_true",
-        default=False,
-        help="Disable bounding box overlay images (enabled by default)",
-    )
-    parser.add_argument(
-        "--enable-fallbacks",
-        action="store_true",
-        help="Enable crop_mode fallback when base attempt fails (may cause CUDA errors)",
-    )
-    parser.add_argument(
-        "--disable-fallbacks",
-        action="store_true",
-        help="[DEPRECATED] Use --enable-fallbacks instead. Fallbacks are now disabled by default.",
-    )
-    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend], help="Backend: huggingface or ollama")
-    parser.add_argument(
-        "--mode",
-        default="extract_all",
-        choices=list(INFERENCE_MODES.keys()),
-        help="Inference mode with optimized settings (extract_all is default)",
-    )
-    parser.add_argument(
-        "--prompt",
-        default=None,
-        help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
-    )
-    parser.add_argument("--test-compress", action="store_true", help="Enable test_compress mode for compression diagnostics")
-    parser.add_argument("--base-size", type=int, default=None, help="Override base_size (e.g., 512, 768, 1024, 1280)")
-    parser.add_argument("--image-size", type=int, default=None, help="Override image_size (e.g., 384, 512, 640, 768, 896)")
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Maximum tokens to generate (default: model default)")
-    parser.add_argument(
-        "--legacy-document-json",
-        action="store_true",
-        default=False,
-        help="Write legacy document.json in addition to per-page spec files (default: OFF)",
-    )
-    return parser.parse_args(argv)
-
-
-def parse_page_selection(pages: Optional[List[int]], page_range: Optional[str], total_pages: int) -> List[int]:
-    def normalize(idx: int) -> int:
-        return idx - 1
-
-    if pages:
-        return [normalize(p) for p in pages if 1 <= p <= total_pages]
-    if page_range:
-        try:
-            start_s, end_s = page_range.split("-")
-            start, end = int(start_s), int(end_s)
-            start = max(start, 1)
-            end = min(end, total_pages)
-            if start <= end:
-                return list(range(normalize(start), normalize(end) + 1))
-        except ValueError:
-            pass
-    return list(range(total_pages))
-
+# ...existing code...
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
