@@ -75,18 +75,30 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 5000
+# Prefer a pixel-area cap rather than forcing a small max dimension.
+# ~10–12 MP keeps tables readable without exploding runtime/memory.
+MAX_PIXEL_AREA = 12_000_000
 
-DEFAULT_PROMPT_EXTRACT_ALL = "<image>\nFree OCR."
+# Keep DPI sane; increase selectively only when needed.
+DEFAULT_DPI = 200
+
+DEFAULT_PROMPT_EXTRACT_ALL = (
+    "<image>\n"
+    "<|grounding|>Extract the full document content in reading order. "
+    "1) Output grounded blocks using <|ref|>...</|ref|> and <|det|>...</|det|>. "
+    "2) Do not omit any text. "
+    "3) For tables: output as HTML <table>...</table> inside the corresponding block. "
+    "4) Preserve numbers, units, and punctuation exactly. No paraphrasing."
+)
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
 # Mode-specific inference configurations
 INFERENCE_MODES = {
     "extract_all": {
-        "prompt": "<image>\n<|grounding|>Extract all text and data.",
+        "prompt": DEFAULT_PROMPT_EXTRACT_ALL,
         "base_size": 1024,
-        "image_size": 1024,
+        "image_size": 768,
         "crop_mode": False,
     },
     "document": {
@@ -165,9 +177,15 @@ INFERENCE_MODES = {
 
 INFERENCE_CONFIG = {
     "base_size": 1024,
-    "image_size": 640,
-    "crop_mode": True,
+    "image_size": 768,
+    "crop_mode": False,
     "test_compress": False,
+    # Deterministic generation / stable outputs
+    "do_sample": False,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    # Prevent truncation on long pages (override via CLI if needed)
+    "max_new_tokens": 8000,
 }
 
 # Logging
@@ -426,14 +444,9 @@ def render_pdf_to_images(
 ) -> List[Path]:
     """Render selected PDF pages to images.
 
-    Args:
-        pdf_path: Input PDF path.
-        dpi: Render DPI.
-        tmp_dir: Output directory for rendered page images.
-        page_indices: Optional list of 0-based page indices to render.
-
-    Returns:
-        List of rendered image paths.
+    Key behaviors:
+      - Honors PDF page rotation (very common for landscape scans)
+      - Caps by pixel area (~12MP) to preserve table readability
     """
     doc = fitz.open(pdf_path)
     image_paths: List[Path] = []
@@ -452,14 +465,12 @@ def render_pdf_to_images(
         page = doc[page_index]
         t0 = time.time()
 
-        # IMPORTANT: Many PDFs store pages rotated (e.g., 90/270). If we ignore this,
-        # the model sees sideways text and may fail or take far longer.
+        # Non-negotiable: honor PDF rotation.
         try:
             rotation = int(page.rotation or 0)
         except Exception:
             rotation = 0
 
-        # Apply rotation to the render matrix so the output image is upright.
         matrix = fitz.Matrix(zoom, zoom).prerotate(rotation)
 
         with _PerfTimer(
@@ -486,26 +497,33 @@ def render_pdf_to_images(
             if img.mode != "RGB":
                 img = img.convert("RGB")
 
-        if max(img.size) > MAX_IMAGE_DIMENSION:
-            original_size = img.size
-            scale = MAX_IMAGE_DIMENSION / max(img.size)
-            new_size = (int(img.width * scale), int(img.height * scale))
+        # Pixel-area cap (~12MP) instead of hard max dimension.
+        w, h = img.size
+        area = int(w * h)
+        if area > MAX_PIXEL_AREA:
+            scale = (MAX_PIXEL_AREA / float(area)) ** 0.5
+            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
             resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
             with _PerfTimer(
                 logger,
-                "pil.resize",
+                "pil.resize.pixel_cap",
                 page_id=f"P{page_index+1:03d}",
-                original=list(original_size),
+                original=[w, h],
                 new=list(new_size),
+                original_area=area,
+                cap=MAX_PIXEL_AREA,
                 scale=round(scale, 4),
             ):
                 img = img.resize(new_size, resample)
-            logger.debug(
-                "[RENDER][P%03d] resized from %s to %s (max_dim=%d)",
+            logger.info(
+                "[RENDER][P%03d] pixel-cap resize %dx%d (%d px) -> %dx%d (%d px)",
                 page_index + 1,
-                original_size,
-                new_size,
-                MAX_IMAGE_DIMENSION,
+                w,
+                h,
+                area,
+                new_size[0],
+                new_size[1],
+                int(new_size[0] * new_size[1]),
             )
 
         img_path = tmp_dir / f"page_{page_index}.png"
@@ -515,7 +533,7 @@ def render_pdf_to_images(
 
         elapsed_sec = time.time() - t0
         logger.info(
-            "[RENDER][P%03d] dpi=%d size=%dx%d rot=%s applied_rot=%s time=%.3fs",
+            "[RENDER][P%03d] dpi=%d pix=%dx%d pdf_rot=%s applied_rot=%s time=%.3fs",
             page_index + 1,
             dpi,
             pixmap.width,
