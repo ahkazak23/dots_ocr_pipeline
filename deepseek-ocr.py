@@ -77,7 +77,7 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 MAX_IMAGE_DIMENSION = 5000
 
-DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Extract all text and data."
+DEFAULT_PROMPT_EXTRACT_ALL = "<image>\nFree OCR."
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
