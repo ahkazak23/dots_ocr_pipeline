@@ -86,7 +86,7 @@ INFERENCE_MODES = {
     "extract_all": {
         "prompt": "<image>\n<|grounding|>Extract all text and data.",
         "base_size": 1024,
-        "image_size": 640,
+        "image_size": 1024,
         "crop_mode": False,
     },
     "document": {
