@@ -165,7 +165,7 @@ INFERENCE_MODES = {
 
 INFERENCE_CONFIG = {
     "base_size": 1024,
-    "image_size": 640,
+    "image_size": 1024,
     "crop_mode": False,
     "test_compress": False,
 }
