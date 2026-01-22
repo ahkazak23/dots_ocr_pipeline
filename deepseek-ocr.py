@@ -47,6 +47,7 @@ logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 
 try:
     from colorama import init as colorama_init, Fore, Style
+
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
@@ -54,6 +55,8 @@ except ImportError:
     class _DummyColor:
         def __getattr__(self, name):
             return ""
+
+
     Fore = _DummyColor()
     Style = _DummyColor()
     COLORS_AVAILABLE = False
@@ -83,12 +86,7 @@ MAX_PIXEL_AREA = 12_000_000
 DEFAULT_DPI = 200
 
 DEFAULT_PROMPT_EXTRACT_ALL = (
-    "<image>\n"
-    "<|grounding|>Extract the full document content in reading order. "
-    "1) Output grounded blocks using <|ref|>...</|ref|> and <|det|>...</|det|>. "
-    "2) Do not omit any text. "
-    "3) For tables: output as HTML <table>...</table> inside the corresponding block. "
-    "4) Preserve numbers, units, and punctuation exactly. No paraphrasing."
+    "<image>\n<|grounding|>Convert the document to markdown. Do not omit any rows or columns from tables. Preserve full table structure."
 )
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
@@ -178,7 +176,7 @@ INFERENCE_MODES = {
 INFERENCE_CONFIG = {
     "base_size": 1024,
     "image_size": 768,
-    "crop_mode": False,
+    "crop_mode": True,
     "test_compress": False,
     # Deterministic generation / stable outputs
     "do_sample": False,
@@ -187,6 +185,7 @@ INFERENCE_CONFIG = {
     # Prevent truncation on long pages (override via CLI if needed)
     "max_new_tokens": 8000,
 }
+
 
 # Logging
 
@@ -281,7 +280,8 @@ class _PerfTimer:
 
     def __enter__(self):
         prefix = f"[{self.page_id}] " if self.page_id else ""
-        self.logger.debug("%s[PERF][START] %s fields=%s cuda_before=%s", prefix, self.scope, self.fields, _summarize_cuda(self.cuda_before))
+        self.logger.debug("%s[PERF][START] %s fields=%s cuda_before=%s", prefix, self.scope, self.fields,
+                          _summarize_cuda(self.cuda_before))
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -344,6 +344,7 @@ class Backend(str, enum.Enum):
     HUGGINGFACE = "huggingface"
     OLLAMA = "ollama"
 
+
 # Config
 
 @dataclass
@@ -383,7 +384,8 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
             return "cuda", "cuda"
         logger.warning("CUDA requested but not available; falling back to CPU")
         logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-        logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+        logger.info(
+            "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
         return "cpu", "cpu"
     if arg == "mps":
         if torch.backends.mps.is_available():
@@ -400,11 +402,13 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
         return "mps", "mps"
     logger.warning("No GPU available; using CPU")
     logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-    logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+    logger.info(
+        "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
     return "cpu", "cpu"
 
 
-def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> Tuple[Any, Any]:
+def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
+Tuple[Any, Any]:
     if backend == Backend.OLLAMA:
         logger.info("Using Ollama backend; model is managed by Ollama daemon")
         return None, None
@@ -436,11 +440,11 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
 
 
 def render_pdf_to_images(
-    pdf_path: Path,
-    dpi: int,
-    tmp_dir: Path,
-    logger: logging.Logger,
-    page_indices: Optional[List[int]] = None,
+        pdf_path: Path,
+        dpi: int,
+        tmp_dir: Path,
+        logger: logging.Logger,
+        page_indices: Optional[List[int]] = None,
 ) -> List[Path]:
     """Render selected PDF pages to images.
 
@@ -474,24 +478,24 @@ def render_pdf_to_images(
         matrix = fitz.Matrix(zoom, zoom).prerotate(rotation)
 
         with _PerfTimer(
-            logger,
-            "pdf.get_pixmap",
-            page_id=f"P{page_index+1:03d}",
-            dpi=dpi,
-            rotation=rotation,
-            zoom=zoom,
+                logger,
+                "pdf.get_pixmap",
+                page_id=f"P{page_index + 1:03d}",
+                dpi=dpi,
+                rotation=rotation,
+                zoom=zoom,
         ):
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
 
         mode = "RGB" if pixmap.n < 4 else "RGBA"
         with _PerfTimer(
-            logger,
-            "pixmap.to_pil",
-            page_id=f"P{page_index+1:03d}",
-            pix_w=pixmap.width,
-            pix_h=pixmap.height,
-            pix_n=pixmap.n,
-            mode=mode,
+                logger,
+                "pixmap.to_pil",
+                page_id=f"P{page_index + 1:03d}",
+                pix_w=pixmap.width,
+                pix_h=pixmap.height,
+                pix_n=pixmap.n,
+                mode=mode,
         ):
             img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
             if img.mode != "RGB":
@@ -505,14 +509,14 @@ def render_pdf_to_images(
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
             resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
             with _PerfTimer(
-                logger,
-                "pil.resize.pixel_cap",
-                page_id=f"P{page_index+1:03d}",
-                original=[w, h],
-                new=list(new_size),
-                original_area=area,
-                cap=MAX_PIXEL_AREA,
-                scale=round(scale, 4),
+                    logger,
+                    "pil.resize.pixel_cap",
+                    page_id=f"P{page_index + 1:03d}",
+                    original=[w, h],
+                    new=list(new_size),
+                    original_area=area,
+                    cap=MAX_PIXEL_AREA,
+                    scale=round(scale, 4),
             ):
                 img = img.resize(new_size, resample)
             logger.info(
@@ -527,7 +531,7 @@ def render_pdf_to_images(
             )
 
         img_path = tmp_dir / f"page_{page_index}.png"
-        with _PerfTimer(logger, "pil.save", page_id=f"P{page_index+1:03d}", out=str(img_path)):
+        with _PerfTimer(logger, "pil.save", page_id=f"P{page_index + 1:03d}", out=str(img_path)):
             img.save(img_path)
         image_paths.append(img_path)
 
@@ -675,11 +679,11 @@ def try_parse_markdown_table(md: str) -> Optional[Dict[str, Any]]:
 
 
 def build_spec_page_payload(
-    document_id: str,
-    page_id: str,
-    resolution: List[int],
-    blocks: List[Dict[str, Any]],
-    warnings: Optional[List[str]] = None,
+        document_id: str,
+        page_id: str,
+        resolution: List[int],
+        blocks: List[Dict[str, Any]],
+        warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build a per-page spec payload."""
     payload = {
@@ -696,16 +700,17 @@ def build_spec_page_payload(
 
 
 def parse_grounded_stdout(
-    captured: str,
-    image_path: Path,
-    logger: logging.Logger,
+        captured: str,
+        image_path: Path,
+        logger: logging.Logger,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
 
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
     """
-    with _PerfTimer(logger, "parse.open_image", page_id=image_path.stem, image=image_path.name, captured_chars=len(captured)):
+    with _PerfTimer(logger, "parse.open_image", page_id=image_path.stem, image=image_path.name,
+                    captured_chars=len(captured)):
         img = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     resolution = [img_w, img_h]
@@ -778,10 +783,10 @@ def _has_grounding_tags(text: str) -> bool:
 
 
 def _run_inference(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    infer_config: Dict[str, Any],
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        infer_config: Dict[str, Any],
 ) -> Tuple[str, float]:
     """Run model inference and capture output.
 
@@ -860,10 +865,10 @@ def _run_inference(
 
 
 def _run_ollama_inference(
-    image_path: Path,
-    logger: logging.Logger,
-    prompt: str,
-    model_name: str = "deepseek-ocr",
+        image_path: Path,
+        logger: logging.Logger,
+        prompt: str,
+        model_name: str = "deepseek-ocr",
 ) -> Tuple[str, float]:
     """Run inference via Ollama HTTP API with an image."""
     t0 = time.time()
@@ -908,14 +913,14 @@ def _run_ollama_inference(
 
 
 def run_page_ocr(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    infer_config: Dict[str, Any],
-    logger: logging.Logger,
-    page_id: str = "",
-    disable_fallbacks: bool = False,
-    backend: Backend = Backend.HUGGINGFACE,
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        infer_config: Dict[str, Any],
+        logger: logging.Logger,
+        page_id: str = "",
+        disable_fallbacks: bool = False,
+        backend: Backend = Backend.HUGGINGFACE,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run OCR on a single page image.
 
@@ -1041,18 +1046,18 @@ def parse_page_selection(pages: Optional[List[int]], page_range: Optional[str], 
 
 
 def process_document(
-    model: Any,
-    tokenizer: Any,
-    input_path: Path,
-    cfg: Config,
-    output_root: Path,
-    selection_label: str,
-    logger: logging.Logger,
-    pages: Optional[List[int]] = None,
-    page_range: Optional[str] = None,
-    backend: Backend = Backend.HUGGINGFACE,
-    inference_config: Optional[Dict[str, Any]] = None,
-    legacy_document_json: bool = False,
+        model: Any,
+        tokenizer: Any,
+        input_path: Path,
+        cfg: Config,
+        output_root: Path,
+        selection_label: str,
+        logger: logging.Logger,
+        pages: Optional[List[int]] = None,
+        page_range: Optional[str] = None,
+        backend: Backend = Backend.HUGGINGFACE,
+        inference_config: Optional[Dict[str, Any]] = None,
+        legacy_document_json: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Process one input document and write per-page outputs.
 
@@ -1075,7 +1080,8 @@ def process_document(
             pdf_doc.close()
 
             selected_indices = parse_page_selection(pages, page_range, total_pages)
-            with _PerfTimer(logger, "pdf.render_selected", page_id=input_path.stem, pages=len(selected_indices), dpi=cfg.dpi):
+            with _PerfTimer(logger, "pdf.render_selected", page_id=input_path.stem, pages=len(selected_indices),
+                            dpi=cfg.dpi):
                 page_image_paths = render_pdf_to_images(
                     input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
                 )
@@ -1124,7 +1130,8 @@ def process_document(
                 if cfg.save_bbox_overlay:
                     with _PerfTimer(logger, "page.save_bbox_overlay", page_id=page_id):
                         try:
-                            save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
+                            save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []),
+                                            page_dir / "page_bbox.png")
                         except Exception as exc:
                             logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
@@ -1160,7 +1167,8 @@ def process_document(
                     warnings=page_warnings if page_warnings else None,
                 )
 
-                with _PerfTimer(logger, "page.write_json", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
+                with _PerfTimer(logger, "page.write_json", page_id=page_id,
+                                out=str(selection_dir / f"page_{page_index + 1}.json")):
                     page_json_path = selection_dir / f"page_{page_index + 1}.json"
                     page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1210,7 +1218,8 @@ def process_document(
                     blocks=[],
                     warnings=error_warnings,
                 )
-                with _PerfTimer(logger, "page.write_json.error", page_id=page_id, out=str(selection_dir / f"page_{page_index + 1}.json")):
+                with _PerfTimer(logger, "page.write_json.error", page_id=page_id,
+                                out=str(selection_dir / f"page_{page_index + 1}.json")):
                     page_json_path = selection_dir / f"page_{page_index + 1}.json"
                     page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1279,12 +1288,12 @@ def process_document(
 
 
 def write_run_summary(
-    eval_dir: Path,
-    run_items: List[Dict[str, Any]],
-    total_time: float,
-    total_pages: int,
-    device: str,
-    model: str,
+        eval_dir: Path,
+        run_items: List[Dict[str, Any]],
+        total_time: float,
+        total_pages: int,
+        device: str,
+        model: str,
 ) -> Path:
     eval_dir.mkdir(parents=True, exist_ok=True)
     ts_filename = time.strftime("%Y%m%d_%H%M%S")
@@ -1307,14 +1316,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek-OCR pipeline")
     parser.add_argument("--input", required=True, help="Path to a PDF, image, or folder of files")
     parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
-    parser.add_argument("--eval-output-dir", default="./evaluation_output", help="Directory for evaluation run summaries (default: ./evaluation_output)")
+    parser.add_argument("--eval-output-dir", default="./evaluation_output",
+                        help="Directory for evaluation run summaries (default: ./evaluation_output)")
     parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
     parser.add_argument("--revision", default=None, help="Optional model revision")
     parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
     parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level")
-    parser.add_argument("--keep-renders", action="store_true", help="Persist rendered page images under page folders (recommended)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Console log level")
+    parser.add_argument("--keep-renders", action="store_true",
+                        help="Persist rendered page images under page folders (recommended)")
     parser.add_argument(
         "--no-bbox-overlay",
         action="store_true",
@@ -1331,7 +1343,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="[DEPRECATED] Use --enable-fallbacks instead. Fallbacks are now disabled by default.",
     )
-    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend], help="Backend: huggingface or ollama")
+    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend],
+                        help="Backend: huggingface or ollama")
     parser.add_argument(
         "--mode",
         default="extract_all",
@@ -1343,10 +1356,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
     )
-    parser.add_argument("--test-compress", action="store_true", help="Enable test_compress mode for compression diagnostics")
+    parser.add_argument("--test-compress", action="store_true",
+                        help="Enable test_compress mode for compression diagnostics")
     parser.add_argument("--base-size", type=int, default=None, help="Override base_size (e.g., 512, 768, 1024, 1280)")
-    parser.add_argument("--image-size", type=int, default=None, help="Override image_size (e.g., 384, 512, 640, 768, 896)")
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Maximum tokens to generate (default: model default)")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="Override image_size (e.g., 384, 512, 640, 768, 896)")
+    parser.add_argument("--max-new-tokens", type=int, default=None,
+                        help="Maximum tokens to generate (default: model default)")
     parser.add_argument(
         "--legacy-document-json",
         action="store_true",
