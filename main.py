@@ -26,7 +26,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 
 try:
-    from colorama import Fore, Style, init as colorama_init
+    from colorama import Fore, Style, Back, init as colorama_init
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
@@ -35,6 +35,7 @@ except ImportError:
             return ""
     Fore = _DummyColor()
     Style = _DummyColor()
+    Back = _DummyColor()
     COLORS_AVAILABLE = False
     def colorama_init(**kwargs):
         pass
@@ -111,13 +112,75 @@ RUNAWAY_PATTERNS = [
 
 class ColoredFormatter(logging.Formatter):
     LEVEL_COLORS = {
-        logging.DEBUG: Fore.CYAN, logging.INFO: Fore.GREEN,
-        logging.WARNING: Fore.YELLOW, logging.ERROR: Fore.RED,
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
         logging.CRITICAL: Fore.RED + Style.BRIGHT,
     }
+
     def format(self, record):
         if COLORS_AVAILABLE:
-            record.levelname = f"{self.LEVEL_COLORS.get(record.levelno, '')}{record.levelname}{Style.RESET_ALL}"
+            try:
+                # Color the level name
+                record.levelname = f"{self.LEVEL_COLORS.get(record.levelno, '')}{record.levelname}{Style.RESET_ALL}"
+
+                # Colorize the message content
+                msg = str(record.msg)
+
+                # Color document/page identifiers (in brackets) - magenta
+                msg = re.sub(r'\[([^\]]+)\]', lambda m: f'{Fore.MAGENTA}[{m.group(1)}]{Style.RESET_ALL}', msg)
+
+                # Color timing information (numbers with 's', 'ms', or 'sec') - cyan
+                msg = re.sub(r'(\d+\.?\d*)(s|ms|sec)\b', lambda m: f'{Fore.CYAN}{m.group(1)}{m.group(2)}{Style.RESET_ALL}', msg)
+
+                # Color file paths (anything with / or \ and extensions) - blue
+                msg = re.sub(r'([^\s]+\.(png|jpg|jpeg|json|pdf|txt))', lambda m: f'{Fore.BLUE}{m.group(1)}{Style.RESET_ALL}', msg)
+
+                # Color status keywords - green/red/yellow bright
+                msg = re.sub(r'\b(SUCCESS|SUCCEEDED|SUCCESS_BASE|SUCCESS_CROP|COMPLETED)\b',
+                           f'{Fore.GREEN + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+                msg = re.sub(r'\b(FAILED|ERROR|FAIL|FAILURE)\b',
+                           f'{Fore.RED + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+                msg = re.sub(r'\b(WARNING|WARN|CAUTION)\b',
+                           f'{Fore.YELLOW + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+                msg = re.sub(r'\b(FALLBACK|RETRY|RETRYING|ATTEMPTING)\b',
+                           f'{Fore.YELLOW}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+
+                # Color memory info (GB, MB, KB) - yellow
+                msg = re.sub(r'(\d+\.?\d*)(GB|MB|KB)\b', lambda m: f'{Fore.YELLOW}{m.group(1)}{m.group(2)}{Style.RESET_ALL}', msg)
+
+                # Color mode names - cyan bright
+                msg = re.sub(r'\b(layout_all_en|ocr|layout_only_en|extract_all|base|crop|mode)\b',
+                           f'{Fore.CYAN + Style.BRIGHT}\\1{Style.RESET_ALL}', msg)
+
+                # Color percentages - cyan
+                msg = re.sub(r'(\d+)%', lambda m: f'{Fore.CYAN}{m.group(1)}%{Style.RESET_ALL}', msg)
+
+                # Color resolution/dimensions (e.g., 1024x768, [1024, 768]) - magenta
+                msg = re.sub(r'(\d+)x(\d+)', lambda m: f'{Fore.MAGENTA}{m.group(1)}x{m.group(2)}{Style.RESET_ALL}', msg)
+                msg = re.sub(r'\[(\d+),\s*(\d+)\]', lambda m: f'[{Fore.MAGENTA}{m.group(1)}, {m.group(2)}{Style.RESET_ALL}]', msg)
+
+                # Color special indicators - various colors
+                msg = re.sub(r'\b(cuda|gpu|cpu)\b', f'{Fore.YELLOW}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+                msg = re.sub(r'\b(page|document|block|element)\s+(\d+)',
+                           lambda m: f'{Fore.WHITE}{m.group(1)} {Fore.CYAN + Style.BRIGHT}{m.group(2)}{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+
+                # Color DPI values - cyan
+                msg = re.sub(r'\bdpi[=:]?\s*(\d+)', lambda m: f'dpi={Fore.CYAN}{m.group(1)}{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
+
+                # Color process indicators - green
+                msg = re.sub(r'\b(Loading|Processing|Rendering|Extracting|Saving|Writing)\b',
+                           f'{Fore.GREEN}\\1{Style.RESET_ALL}', msg)
+
+                # Color rotation info - magenta
+                msg = re.sub(r'\brot[=:]?\s*(\d+)', lambda m: f'rot={Fore.MAGENTA}{m.group(1)}{Style.RESET_ALL}', msg)
+
+                record.msg = msg
+            except Exception:
+                # If colorization fails, just use the original message
+                pass
+
         return super().format(record)
 
 
