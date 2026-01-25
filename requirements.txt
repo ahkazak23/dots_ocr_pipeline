@@ -12,3 +12,4 @@ accelerate>=1.12.0
 qwen-vl-utils>=0.0.11
 av>=15.0.0
 flash-attn==2.8.0.post2  # Successfully compiled and installed!
+colorama
