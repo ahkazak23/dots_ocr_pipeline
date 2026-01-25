@@ -26,7 +26,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 
 try:
-    from colorama import Fore, Style, Back, init as colorama_init
+    from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
@@ -35,7 +35,6 @@ except ImportError:
             return ""
     Fore = _DummyColor()
     Style = _DummyColor()
-    Back = _DummyColor()
     COLORS_AVAILABLE = False
     def colorama_init(**kwargs):
         pass
@@ -93,8 +92,8 @@ CATEGORY_TO_TYPE = {
     "Table": "table",
     "Formula": "paragraph",  # Store as paragraph but preserve category in data
     "Picture": "image",
-    "Page-header": "page-header",  # Special: optionally dropped
-    "Page-footer": "page-footer",  # Special: optionally dropped
+    "Page-header": "page-header",
+    "Page-footer": "page-footer",
 }
 
 # Runaway detection patterns
@@ -112,75 +111,13 @@ RUNAWAY_PATTERNS = [
 
 class ColoredFormatter(logging.Formatter):
     LEVEL_COLORS = {
-        logging.DEBUG: Fore.CYAN,
-        logging.INFO: Fore.GREEN,
-        logging.WARNING: Fore.YELLOW,
-        logging.ERROR: Fore.RED,
+        logging.DEBUG: Fore.CYAN, logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW, logging.ERROR: Fore.RED,
         logging.CRITICAL: Fore.RED + Style.BRIGHT,
     }
-
     def format(self, record):
         if COLORS_AVAILABLE:
-            try:
-                # Color the level name
-                record.levelname = f"{self.LEVEL_COLORS.get(record.levelno, '')}{record.levelname}{Style.RESET_ALL}"
-
-                # Colorize the message content
-                msg = str(record.msg)
-
-                # Color document/page identifiers (in brackets) - magenta
-                msg = re.sub(r'\[([^\]]+)\]', lambda m: f'{Fore.MAGENTA}[{m.group(1)}]{Style.RESET_ALL}', msg)
-
-                # Color timing information (numbers with 's', 'ms', or 'sec') - cyan
-                msg = re.sub(r'(\d+\.?\d*)(s|ms|sec)\b', lambda m: f'{Fore.CYAN}{m.group(1)}{m.group(2)}{Style.RESET_ALL}', msg)
-
-                # Color file paths (anything with / or \ and extensions) - blue
-                msg = re.sub(r'([^\s]+\.(png|jpg|jpeg|json|pdf|txt))', lambda m: f'{Fore.BLUE}{m.group(1)}{Style.RESET_ALL}', msg)
-
-                # Color status keywords - green/red/yellow bright
-                msg = re.sub(r'\b(SUCCESS|SUCCEEDED|SUCCESS_BASE|SUCCESS_CROP|COMPLETED)\b',
-                           f'{Fore.GREEN + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-                msg = re.sub(r'\b(FAILED|ERROR|FAIL|FAILURE)\b',
-                           f'{Fore.RED + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-                msg = re.sub(r'\b(WARNING|WARN|CAUTION)\b',
-                           f'{Fore.YELLOW + Style.BRIGHT}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-                msg = re.sub(r'\b(FALLBACK|RETRY|RETRYING|ATTEMPTING)\b',
-                           f'{Fore.YELLOW}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-
-                # Color memory info (GB, MB, KB) - yellow
-                msg = re.sub(r'(\d+\.?\d*)(GB|MB|KB)\b', lambda m: f'{Fore.YELLOW}{m.group(1)}{m.group(2)}{Style.RESET_ALL}', msg)
-
-                # Color mode names - cyan bright
-                msg = re.sub(r'\b(layout_all_en|ocr|layout_only_en|extract_all|base|crop|mode)\b',
-                           f'{Fore.CYAN + Style.BRIGHT}\\1{Style.RESET_ALL}', msg)
-
-                # Color percentages - cyan
-                msg = re.sub(r'(\d+)%', lambda m: f'{Fore.CYAN}{m.group(1)}%{Style.RESET_ALL}', msg)
-
-                # Color resolution/dimensions (e.g., 1024x768, [1024, 768]) - magenta
-                msg = re.sub(r'(\d+)x(\d+)', lambda m: f'{Fore.MAGENTA}{m.group(1)}x{m.group(2)}{Style.RESET_ALL}', msg)
-                msg = re.sub(r'\[(\d+),\s*(\d+)\]', lambda m: f'[{Fore.MAGENTA}{m.group(1)}, {m.group(2)}{Style.RESET_ALL}]', msg)
-
-                # Color special indicators - various colors
-                msg = re.sub(r'\b(cuda|gpu|cpu)\b', f'{Fore.YELLOW}\\1{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-                msg = re.sub(r'\b(page|document|block|element)\s+(\d+)',
-                           lambda m: f'{Fore.WHITE}{m.group(1)} {Fore.CYAN + Style.BRIGHT}{m.group(2)}{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-
-                # Color DPI values - cyan
-                msg = re.sub(r'\bdpi[=:]?\s*(\d+)', lambda m: f'dpi={Fore.CYAN}{m.group(1)}{Style.RESET_ALL}', msg, flags=re.IGNORECASE)
-
-                # Color process indicators - green
-                msg = re.sub(r'\b(Loading|Processing|Rendering|Extracting|Saving|Writing)\b',
-                           f'{Fore.GREEN}\\1{Style.RESET_ALL}', msg)
-
-                # Color rotation info - magenta
-                msg = re.sub(r'\brot[=:]?\s*(\d+)', lambda m: f'rot={Fore.MAGENTA}{m.group(1)}{Style.RESET_ALL}', msg)
-
-                record.msg = msg
-            except Exception:
-                # If colorization fails, just use the original message
-                pass
-
+            record.levelname = f"{self.LEVEL_COLORS.get(record.levelno, '')}{record.levelname}{Style.RESET_ALL}"
         return super().format(record)
 
 
@@ -213,7 +150,6 @@ class Config:
     fallback_enabled: bool = True
     save_rendered_images: bool = False
     save_bbox_overlay: bool = True
-    drop_header_footer: bool = True
     log_level: str = "INFO"
     device: str = "auto"
     dtype: str = "bfloat16"
@@ -987,7 +923,7 @@ def _parse_html_table_to_structure(html_text: str, logger: Optional[logging.Logg
 
 def normalize_dots_output(
     page_index: int, dots_json: Dict[str, Any], img_size: Tuple[int, int],
-    drop_header_footer: bool, logger: logging.Logger
+    logger: logging.Logger
 ) -> Dict[str, Any]:
     """Normalize dots.ocr JSON to unified block schema with normalized bboxes (0-1 range)."""
     img_w, img_h = img_size
@@ -1005,8 +941,6 @@ def normalize_dots_output(
         category = elem.get("category", "Text")
         block_type = CATEGORY_TO_TYPE.get(category, "paragraph")
 
-        if drop_header_footer and block_type in ["page-header", "page-footer"]:
-            continue
 
         # Get bbox and convert to normalized coordinates [x, y, width, height] in 0-1 range
         bbox_raw = elem.get("bbox", [0, 0, 0, 0])
@@ -1224,7 +1158,7 @@ def process_document(
                 # Normalize to unified schema
                 if dots_json:
                     page_ocr = normalize_dots_output(
-                        page_index, dots_json, img_size, cfg.drop_header_footer, logger
+                        page_index, dots_json, img_size, logger
                     )
                 else:
                     page_ocr = {"ocr": {"blocks": []}}
@@ -1381,7 +1315,6 @@ def process_document(
             "dpi": cfg.dpi if input_type == "pdf" else None,
             "prompt_mode": cfg.prompt_mode,
             "fallback_enabled": cfg.fallback_enabled,
-            "drop_header_footer": cfg.drop_header_footer,
             "warnings": warnings_list,
             "output_dir": str(selection_dir),
         },
@@ -1507,10 +1440,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Disable saving page_bbox.png with bounding boxes drawn (default: enabled)"
     )
     parser.add_argument(
-        "--keep-header-footer", action="store_true",
-        help="Keep Page-header and Page-footer blocks (default: drop)"
-    )
-    parser.add_argument(
         "--pages", type=int, nargs="+",
         help="Page indices to process (1-based, e.g., 1 5 10)"
     )
@@ -1547,7 +1476,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         fallback_enabled=not args.disable_fallback,
         save_rendered_images=args.save_rendered_images,
         save_bbox_overlay=not args.no_bbox_overlay,
-        drop_header_footer=not args.keep_header_footer,
         log_level=args.log_level,
         device=args.device,
         dtype=args.dtype,
