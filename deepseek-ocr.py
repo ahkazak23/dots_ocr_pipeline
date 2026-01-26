@@ -26,6 +26,7 @@ import enum
 import base64
 import urllib.request
 import urllib.error
+import threading
 from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass
 from io import StringIO
@@ -47,7 +48,6 @@ logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 
 try:
     from colorama import init as colorama_init, Fore, Style
-
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
@@ -55,8 +55,6 @@ except ImportError:
     class _DummyColor:
         def __getattr__(self, name):
             return ""
-
-
     Fore = _DummyColor()
     Style = _DummyColor()
     COLORS_AVAILABLE = False
@@ -74,123 +72,114 @@ LABEL_TO_TYPE = {
     "table": "table",
     "image": "image",
     "diagram": "diagram",
+    "header": "page-header",
+    "footer": "page-footer",
+    "page-header": "page-header",
+    "page-footer": "page-footer",
 }
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-# Prefer a pixel-area cap rather than forcing a small max dimension.
-# ~10–12 MP keeps tables readable without exploding runtime/memory.
-MAX_PIXEL_AREA = 12_000_000
+MAX_IMAGE_DIMENSION = 2000  # HuggingFace: 2000, Ollama: 1280 works better
 
-# Keep DPI sane; increase selectively only when needed.
-DEFAULT_DPI = 200
-
-DEFAULT_PROMPT_EXTRACT_ALL = (
-    "<image>\n"
-    "<|grounding|>Extract the full document content in reading order. "
-    "1) Output grounded blocks using <|ref|>...</|ref|> and <|det|>...</|det|>. "
-    "2) Do not omit any text. "
-    "3) For tables: output as HTML <table>...</table> inside the corresponding block. "
-    "4) Preserve numbers, units, and punctuation exactly. No paraphrasing."
-)
+DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
 # Mode-specific inference configurations
 INFERENCE_MODES = {
     "extract_all": {
-        "prompt": DEFAULT_PROMPT_EXTRACT_ALL,
+        "prompt": "<image>\n<|grounding|>Free OCR.",
         "base_size": 1024,
-        "image_size": 768,
-        "crop_mode": False,
+        "image_size": 640,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "document": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown. Do not omit any rows or columns from tables. Preserve full table structure.",
+        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
         "base_size": 1024,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "chart": {
-        "prompt": "<image>\n<|grounding|>Parse all charts and tables. Extract data as HTML tables.",
+        "prompt": "<image>\n<|grounding|>Parse all charts and tables.",
         "base_size": 1024,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "dense_text": {
         "prompt": "<image>\n<|grounding|>Free OCR.",
         "base_size": 768,
         "image_size": 512,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "high_detail": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown. Do not omit any rows or columns from tables. Preserve full table structure.",
+        "prompt": "<image>\n<|grounding|>Extract complete document.",
         "base_size": 1024,
         "image_size": 768,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "multilingual": {
-        "prompt": "<image>\n<|grounding|>Extract text. Preserve all languages and structure.",
+        "prompt": "<image>\n<|grounding|>Extract text.",
         "base_size": 1024,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_tiny": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
+        "prompt": "<image>\n<|grounding|>Convert to markdown.",
         "base_size": 512,
         "image_size": 384,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_large": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
+        "prompt": "<image>\n<|grounding|>Convert to markdown.",
         "base_size": 1280,
         "image_size": 896,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_simple_prompt": {
         "prompt": "<image>\n<|grounding|>Extract all text.",
         "base_size": 1024,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_detailed_prompt": {
-        "prompt": "<image>\n<|grounding|>Carefully extract all text from this document. Pay attention to tables, headers, and formatting. Do not skip any content.",
+        "prompt": "<image>\n<|grounding|>Extract all content.",
         "base_size": 1024,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_base_768_img_640": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
+        "prompt": "<image>\n<|grounding|>Convert to markdown.",
         "base_size": 768,
         "image_size": 640,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_base_1024_img_512": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
+        "prompt": "<image>\n<|grounding|>Convert to markdown.",
         "base_size": 1024,
         "image_size": 512,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
     "experimental_base_896_img_768": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
+        "prompt": "<image>\n<|grounding|>Convert to markdown.",
         "base_size": 896,
         "image_size": 768,
-        "crop_mode": False,
+        "crop_mode": True,  # Enable crop mode for edge detection
+    },
+    "layout_first": {
+        "prompt": "<image>\n<|grounding|>Detect layout.",
+        "base_size": 1024,
+        "image_size": 640,
+        "crop_mode": True,  # Enable crop mode for edge detection
     },
 }
 
 INFERENCE_CONFIG = {
     "base_size": 1024,
-    "image_size": 768,
-    "crop_mode": False,
+    "image_size": 640,
+    "crop_mode": True,  # Enable crop mode for edge detection
     "test_compress": False,
-    # Deterministic generation / stable outputs
-    "do_sample": False,
-    "temperature": 0.0,
-    "top_p": 1.0,
-    # Prevent truncation on long pages (override via CLI if needed)
-    "max_new_tokens": 8000,
 }
-
 
 # Logging
 
@@ -231,124 +220,11 @@ def _setup_logger(log_level: str = "INFO") -> logging.Logger:
     return logger
 
 
-# -------------------------
-# Perf / debug log helpers
-# -------------------------
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _fmt_bytes(num: Optional[int]) -> str:
-    if num is None:
-        return "n/a"
-    try:
-        n = float(num)
-    except Exception:
-        return str(num)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024.0:
-            return f"{n:.2f}{unit}"
-        n /= 1024.0
-    return f"{n:.2f}PB"
-
-
-def _cuda_mem_snapshot() -> Dict[str, Any]:
-    """Return a small CUDA memory snapshot (safe on CPU-only)."""
-    if not torch.cuda.is_available():
-        return {"cuda": False}
-    try:
-        idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(idx)
-        return {
-            "cuda": True,
-            "device": idx,
-            "name": props.name,
-            "total": int(props.total_memory),
-            "allocated": int(torch.cuda.memory_allocated(idx)),
-            "reserved": int(torch.cuda.memory_reserved(idx)),
-            "max_allocated": int(torch.cuda.max_memory_allocated(idx)),
-            "max_reserved": int(torch.cuda.max_memory_reserved(idx)),
-        }
-    except Exception as exc:
-        return {"cuda": True, "error": f"{type(exc).__name__}: {exc}"}
-
-
-class _PerfTimer:
-    def __init__(self, logger: logging.Logger, scope: str, page_id: str = "", **fields: Any):
-        self.logger = logger
-        self.scope = scope
-        self.page_id = page_id
-        self.fields = fields
-        self.t0 = time.time()
-        self.cuda_before = _cuda_mem_snapshot()
-
-    def __enter__(self):
-        prefix = f"[{self.page_id}] " if self.page_id else ""
-        self.logger.debug("%s[PERF][START] %s fields=%s cuda_before=%s", prefix, self.scope, self.fields,
-                          _summarize_cuda(self.cuda_before))
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        dt = time.time() - self.t0
-        cuda_after = _cuda_mem_snapshot()
-        prefix = f"[{self.page_id}] " if self.page_id else ""
-        base = {
-            "scope": self.scope,
-            "ms": int(dt * 1000),
-            "fields": self.fields,
-            "cuda_before": _summarize_cuda(self.cuda_before),
-            "cuda_after": _summarize_cuda(cuda_after),
-        }
-        if exc_type is not None:
-            base["error"] = f"{exc_type.__name__}: {exc}"
-            self.logger.error("%s[PERF][END][ERROR] %s", prefix, base)
-        else:
-            # Emit INFO if it looks slow; otherwise DEBUG.
-            if dt >= 5.0:
-                self.logger.info("%s[PERF][END][SLOW] %s", prefix, base)
-            else:
-                self.logger.debug("%s[PERF][END] %s", prefix, base)
-        return False
-
-
-def _summarize_cuda(snap: Dict[str, Any]) -> Dict[str, Any]:
-    if not snap.get("cuda"):
-        return {"cuda": False}
-    if "error" in snap:
-        return {"cuda": True, "error": snap["error"]}
-    return {
-        "cuda": True,
-        "device": snap.get("device"),
-        "name": snap.get("name"),
-        "allocated": _fmt_bytes(snap.get("allocated")),
-        "reserved": _fmt_bytes(snap.get("reserved")),
-        "max_allocated": _fmt_bytes(snap.get("max_allocated")),
-        "max_reserved": _fmt_bytes(snap.get("max_reserved")),
-        "total": _fmt_bytes(snap.get("total")),
-    }
-
-
-def _image_meta(path: Path) -> Dict[str, Any]:
-    """Read minimal image metadata; avoids loading full pixel tensor."""
-    try:
-        with Image.open(path) as im:
-            return {
-                "path": str(path),
-                "format": im.format,
-                "mode": im.mode,
-                "size": [im.size[0], im.size[1]],
-            }
-    except Exception as exc:
-        return {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
-
-
 # Backend
 
 class Backend(str, enum.Enum):
     HUGGINGFACE = "huggingface"
     OLLAMA = "ollama"
-
 
 # Config
 
@@ -364,6 +240,10 @@ class Config:
     debug_keep_renders: bool = True
     save_bbox_overlay: bool = True
     disable_fallbacks: bool = False
+    test_all_modes: bool = False  # Run all inference modes on each page
+    drop_header_footer: bool = False  # Filter out page-header and page-footer blocks
+    skip_low_confidence: bool = False  # Skip blocks with zero bboxes (likely malformed)
+    disable_downscale: bool = False  # Disable MAX_IMAGE_DIMENSION downscaling for edge detection testing
 
 
 @dataclass
@@ -389,8 +269,7 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
             return "cuda", "cuda"
         logger.warning("CUDA requested but not available; falling back to CPU")
         logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-        logger.info(
-            "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+        logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
         return "cpu", "cpu"
     if arg == "mps":
         if torch.backends.mps.is_available():
@@ -407,13 +286,11 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
         return "mps", "mps"
     logger.warning("No GPU available; using CPU")
     logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-    logger.info(
-        "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+    logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
     return "cpu", "cpu"
 
 
-def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
-Tuple[Any, Any]:
+def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> Tuple[Any, Any]:
     if backend == Backend.OLLAMA:
         logger.info("Using Ollama backend; model is managed by Ollama daemon")
         return None, None
@@ -445,34 +322,32 @@ Tuple[Any, Any]:
 
 
 def render_pdf_to_images(
-        pdf_path: Path,
-        dpi: int,
-        tmp_dir: Path,
-        logger: logging.Logger,
-        page_indices: Optional[List[int]] = None,
+    pdf_path: Path,
+    dpi: int,
+    tmp_dir: Path,
+    logger: logging.Logger,
+    page_indices: Optional[List[int]] = None,
+    debug_save_dir: Optional[Path] = None,
+    disable_downscale: bool = False,
 ) -> List[Path]:
     """Render selected PDF pages to images.
 
-    Key behaviors:
-      - Honors PDF page rotation (very common for landscape scans)
-      - Avoids double-rotating: some PDFs have rotation metadata but content is already upright
-      - Caps by pixel area (~12MP) to preserve table readability
+    Args:
+        pdf_path: Input PDF path.
+        dpi: Render DPI.
+        tmp_dir: Output directory for rendered page images.
+        page_indices: Optional list of 0-based page indices to render.
+        debug_save_dir: If provided, save intermediate transformation images here.
+        disable_downscale: If True, skip MAX_IMAGE_DIMENSION downscaling.
 
-    Strategy:
-      - If rotation is 0/180: just render normally with that rotation.
-      - If rotation is 90/270: render two candidates (apply rotation vs. ignore rotation)
-        and pick the candidate whose aspect ratio matches the *expected upright view*.
-        This prevents the regression where portrait pages become landscape.
+    Returns:
+        List of rendered image paths.
     """
-
-    def _render(page_obj: fitz.Page, rot: int) -> fitz.Pixmap:
-        mat = fitz.Matrix(zoom, zoom).prerotate(rot)
-        return page_obj.get_pixmap(matrix=mat, alpha=False)
-
     doc = fitz.open(pdf_path)
     image_paths: List[Path] = []
 
     zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
 
     total_pages = len(doc)
     if page_indices is not None:
@@ -485,136 +360,77 @@ def render_pdf_to_images(
     for page_index in pages_to_render:
         page = doc[page_index]
         t0 = time.time()
-
-        pixmap: Optional[fitz.Pixmap] = None
-
         try:
-            rotation = int(page.rotation or 0) % 360
+            rotation = int(page.rotation)
         except Exception:
-            rotation = 0
+            rotation = None
 
-        chosen_rot = rotation
-        chosen_reason = "apply_pdf_rotation"
+        # Get original PDF page dimensions
+        page_rect = page.rect
+        pdf_width_pt = page_rect.width
+        pdf_height_pt = page_rect.height
 
-        # For 90/270, PDF rotation is often correct… but sometimes the content is already upright.
-        # We'll render both and pick the one that yields portrait-like output (more OCR-friendly).
-        if rotation in (90, 270):
-            with _PerfTimer(logger, "pdf.get_pixmap.candidates", page_id=f"P{page_index + 1:03d}", dpi=dpi, pdf_rotation=rotation, zoom=zoom):
-                pix_apply = _render(page, rotation)
-                pix_ignore = _render(page, 0)
-
-            # Heuristic: prefer portrait (h>=w). Most documents/table pages are portrait.
-            # If both are portrait/landscape, prefer the one closer to portrait.
-            apply_portrait = pix_apply.height >= pix_apply.width
-            ignore_portrait = pix_ignore.height >= pix_ignore.width
-
-            if apply_portrait and not ignore_portrait:
-                chosen_pix = pix_apply
-                chosen_rot = rotation
-                chosen_reason = "rotation_fixed_sideways"
-            elif ignore_portrait and not apply_portrait:
-                chosen_pix = pix_ignore
-                chosen_rot = 0
-                chosen_reason = "rotation_metadata_ignored_double_rotate"
-            else:
-                # Tie-breaker: choose the candidate with larger height/width ratio
-                ratio_apply = pix_apply.height / max(1, pix_apply.width)
-                ratio_ignore = pix_ignore.height / max(1, pix_ignore.width)
-                if ratio_apply >= ratio_ignore:
-                    chosen_pix = pix_apply
-                    chosen_rot = rotation
-                    chosen_reason = "tie_breaker_apply"
-                else:
-                    chosen_pix = pix_ignore
-                    chosen_rot = 0
-                    chosen_reason = "tie_breaker_ignore"
-
-            pixmap = chosen_pix
-
-            logger.info(
-                "[RENDER][P%03d] pdf_rot=%d candidate_apply=%dx%d candidate_ignore=%dx%d chosen_rot=%d reason=%s",
-                page_index + 1,
-                rotation,
-                pix_apply.width,
-                pix_apply.height,
-                pix_ignore.width,
-                pix_ignore.height,
-                chosen_rot,
-                chosen_reason,
-            )
-
-        else:
-            # 0 or 180: just apply rotation.
-            with _PerfTimer(
-                    logger,
-                    "pdf.get_pixmap",
-                    page_id=f"P{page_index + 1:03d}",
-                    dpi=dpi,
-                    rotation=rotation,
-                    zoom=zoom,
-            ):
-                pixmap = _render(page, rotation)
-
-        if pixmap is None:
-            raise RuntimeError("Failed to render PDF page to pixmap")
-
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
         mode = "RGB" if pixmap.n < 4 else "RGBA"
-        with _PerfTimer(
-                logger,
-                "pixmap.to_pil",
-                page_id=f"P{page_index + 1:03d}",
-                pix_w=pixmap.width,
-                pix_h=pixmap.height,
-                pix_n=pixmap.n,
-                mode=mode,
-        ):
-            img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+        img = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
 
-        # Pixel-area cap (~12MP) instead of hard max dimension.
-        w, h = img.size
-        area = int(w * h)
-        if area > MAX_PIXEL_AREA:
-            scale = (MAX_PIXEL_AREA / float(area)) ** 0.5
-            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-            resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
-            with _PerfTimer(
-                    logger,
-                    "pil.resize.pixel_cap",
-                    page_id=f"P{page_index + 1:03d}",
-                    original=[w, h],
-                    new=list(new_size),
-                    original_area=area,
-                    cap=MAX_PIXEL_AREA,
-                    scale=round(scale, 4),
-            ):
-                img = img.resize(new_size, resample)
-            logger.info(
-                "[RENDER][P%03d] pixel-cap resize %dx%d (%d px) -> %dx%d (%d px)",
+        original_size = img.size
+        was_downscaled = False
+
+        # Save Step 1: Original render (after DPI scaling, before MAX_IMAGE_DIMENSION)
+        if debug_save_dir:
+            step1_path = debug_save_dir / f"step1_dpi_render_{img.size[0]}x{img.size[1]}.png"
+            img.save(step1_path)
+            logger.debug(
+                "[RENDER][P%03d] Step 1 saved: DPI render → %s",
                 page_index + 1,
-                w,
-                h,
-                area,
-                new_size[0],
-                new_size[1],
-                int(new_size[0] * new_size[1]),
+                step1_path.name
             )
+
+        if max(img.size) > MAX_IMAGE_DIMENSION and not disable_downscale:
+            original_size = img.size
+            scale = MAX_IMAGE_DIMENSION / max(img.size)
+            new_size = (int(img.width * scale), int(img.height * scale))
+            resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
+            img = img.resize(new_size, resample)
+            was_downscaled = True
+            logger.info(
+                "[RENDER][P%03d] Step 2: Downscaled %s → %s (%.1f%% scale, max_dim=%d)",
+                page_index + 1,
+                original_size,
+                new_size,
+                (new_size[0] / original_size[0]) * 100,
+                MAX_IMAGE_DIMENSION,
+            )
+
+            # Save Step 2: After MAX_IMAGE_DIMENSION downscaling
+            if debug_save_dir:
+                step2_path = debug_save_dir / f"step2_max_dim_{img.size[0]}x{img.size[1]}.png"
+                img.save(step2_path)
+                logger.debug(
+                    "[RENDER][P%03d] Step 2 saved: MAX_IMAGE_DIMENSION downscale → %s",
+                    page_index + 1,
+                    step2_path.name
+                )
 
         img_path = tmp_dir / f"page_{page_index}.png"
-        with _PerfTimer(logger, "pil.save", page_id=f"P{page_index + 1:03d}", out=str(img_path)):
-            img.save(img_path)
+        img.save(img_path)
         image_paths.append(img_path)
 
         elapsed_sec = time.time() - t0
         logger.info(
-            "[RENDER][P%03d] dpi=%d pix=%dx%d pdf_rot=%s applied_rot=%s time=%.3fs",
+            "[RENDER][P%03d] PDF: %.1fx%.1fpt → DPI%d: %dx%d → Final: %dx%d | rot=%s | %.3fs",
             page_index + 1,
+            pdf_width_pt,
+            pdf_height_pt,
             dpi,
             pixmap.width,
             pixmap.height,
-            getattr(page, "rotation", None),
-            chosen_rot,
+            img.size[0],
+            img.size[1],
+            rotation,
             elapsed_sec,
         )
 
@@ -668,6 +484,131 @@ def _det_to_bbox_normalized(det_coords, img_w: int, img_h: int) -> List[float]:
         max(0.0, min(1.0, norm_w)),
         max(0.0, min(1.0, norm_h)),
     ]
+
+
+def classify_header_footer_heuristic(
+    blocks: List[Dict[str, Any]],
+    logger: Optional[logging.Logger] = None
+) -> List[Dict[str, Any]]:
+    """
+    Classify blocks as page-header or page-footer based on heuristics.
+
+    Heuristics:
+    - Top 10% of page → likely header
+    - Bottom 10% of page → likely footer
+    - Contains page numbers (e.g., "Page 1", "1 of 3", "- 1 -")
+    - Small height relative to page (< 5%)
+    - Contains typical header/footer keywords
+
+    Returns updated blocks with corrected types.
+    """
+    HEADER_THRESHOLD = 0.10  # Top 10% of page
+    FOOTER_THRESHOLD = 0.90  # Bottom 10% of page
+    MAX_HEIGHT_RATIO = 0.05  # Max 5% of page height
+
+    FOOTER_PATTERNS = [
+        r'\bpage\s+\d+\b',  # "page 1", "Page 2"
+        r'\b\d+\s+of\s+\d+\b',  # "1 of 3"
+        r'^-?\s*\d+\s*-?$',  # "- 1 -", "1"
+        # Removed year pattern r'\b\d{4}\b' - causes false positives on document dates
+        r'confidential|proprietary|copyright|©',  # Legal text
+    ]
+
+    HEADER_PATTERNS = [
+        r'^(chapter|section)\s+\d+',  # "Chapter 1"
+        r'confidential|draft|internal',
+    ]
+
+    if not blocks:
+        return blocks
+
+    updated_blocks = []
+    header_count = 0
+    footer_count = 0
+
+    for block in blocks:
+        bbox = block.get("bbox", [0, 0, 0, 0])
+        if len(bbox) != 4:
+            updated_blocks.append(block)
+            continue
+
+        x, y, w, h = bbox
+        block_type = block.get("type", "paragraph")
+        text = block.get("extraction_response", "")
+
+        # Skip blocks with zero bbox (corrupted/malformed output)
+        if bbox == [0.0, 0.0, 0.0, 0.0]:
+            if logger:
+                logger.debug(
+                    "[HEURISTIC] Skipping zero-bbox block (corrupted): type=%s, text=%s",
+                    block_type, text[:50] if text else ""
+                )
+            updated_blocks.append(block)
+            continue
+
+        # Skip if already classified
+        if block_type in ["page-header", "page-footer"]:
+            updated_blocks.append(block)
+            continue
+
+        # Skip tables and images from header/footer classification
+        if block_type in ["table", "image", "diagram"]:
+            updated_blocks.append(block)
+            continue
+
+        # Check position-based heuristics
+        is_top_region = y < HEADER_THRESHOLD
+        is_bottom_region = (y + h) > FOOTER_THRESHOLD
+        is_small_height = h < MAX_HEIGHT_RATIO
+
+        # Check content patterns
+        text_lower = text.lower() if text else ""
+        has_footer_pattern = any(re.search(pat, text_lower, re.IGNORECASE) for pat in FOOTER_PATTERNS)
+        has_header_pattern = any(re.search(pat, text_lower, re.IGNORECASE) for pat in HEADER_PATTERNS)
+
+        # Classification logic
+        new_type = block_type
+        reason = None
+
+        if is_bottom_region and is_small_height:
+            new_type = "page-footer"
+            reason = f"bottom region (y+h={y+h:.3f}) + small height (h={h:.3f})"
+            footer_count += 1
+        elif is_bottom_region and has_footer_pattern:
+            new_type = "page-footer"
+            reason = f"bottom region + footer pattern in text"
+            footer_count += 1
+        elif is_top_region and is_small_height:
+            new_type = "page-header"
+            reason = f"top region (y={y:.3f}) + small height (h={h:.3f})"
+            header_count += 1
+        elif is_top_region and has_header_pattern:
+            new_type = "page-header"
+            reason = f"top region + header pattern in text"
+            header_count += 1
+        elif has_footer_pattern and not is_top_region:
+            # Page number anywhere except top
+            new_type = "page-footer"
+            reason = "footer pattern (page number/copyright)"
+            footer_count += 1
+
+        if new_type != block_type:
+            if logger:
+                logger.debug(
+                    "[HEURISTIC] Block reclassified: %s → %s | bbox=[%.3f, %.3f, %.3f, %.3f] | reason: %s | text: %s",
+                    block_type, new_type, x, y, w, h, reason, text[:50]
+                )
+            block = {**block, "type": new_type}
+
+        updated_blocks.append(block)
+
+    if logger and (header_count > 0 or footer_count > 0):
+        logger.info(
+            "[HEURISTIC] Classified %d headers, %d footers from %d blocks",
+            header_count, footer_count, len(blocks)
+        )
+
+    return updated_blocks
 
 
 def normalize_text(text: str) -> str:
@@ -750,11 +691,11 @@ def try_parse_markdown_table(md: str) -> Optional[Dict[str, Any]]:
 
 
 def build_spec_page_payload(
-        document_id: str,
-        page_id: str,
-        resolution: List[int],
-        blocks: List[Dict[str, Any]],
-        warnings: Optional[List[str]] = None,
+    document_id: str,
+    page_id: str,
+    resolution: List[int],
+    blocks: List[Dict[str, Any]],
+    warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build a per-page spec payload."""
     payload = {
@@ -771,68 +712,110 @@ def build_spec_page_payload(
 
 
 def parse_grounded_stdout(
-        captured: str,
-        image_path: Path,
-        logger: logging.Logger,
+    captured: str,
+    image_path: Path,
+    logger: logging.Logger,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
 
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
     """
-    with _PerfTimer(logger, "parse.open_image", page_id=image_path.stem, image=image_path.name,
-                    captured_chars=len(captured)):
-        img = Image.open(image_path).convert("RGB")
+    img = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     resolution = [img_w, img_h]
 
-    with _PerfTimer(logger, "parse.find_refs", page_id=image_path.stem, img_w=img_w, img_h=img_h):
-        matches = list(REF_RE.finditer(captured))
-
+    matches = list(REF_RE.finditer(captured))
     blocks: List[Dict[str, Any]] = []
     bbox_parse_failures = 0
+    malformed_tags = 0
 
-    with _PerfTimer(logger, "parse.blocks", page_id=image_path.stem, match_count=len(matches)):
-        for i, match in enumerate(matches):
-            label = match.group("label").strip()
-            det_text = match.group("det").strip()
-            start = match.end()
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(captured)
-            content = captured[start:end].strip()
+    # Check for malformed grounding tags (incomplete <|det|> or corrupted output)
+    if "<|ref|>" in captured:
+        # Count incomplete tags
+        ref_count = captured.count("<|ref|>")
+        det_count = captured.count("<|det|>")
+        det_close_count = captured.count("<|/det|>")
 
-            try:
-                det_coords = _parse_det(det_text)
-                bbox = _det_to_bbox_normalized(det_coords, img_w, img_h)
-            except Exception as exc:
-                bbox = [0.0, 0.0, 0.0, 0.0]
-                bbox_parse_failures += 1
+        if ref_count != det_count or det_count != det_close_count:
+            logger.warning(
+                "[MALFORMED] Unbalanced grounding tags on %s: ref=%d, det=%d, /det=%d",
+                image_path.name, ref_count, det_count, det_close_count
+            )
+            malformed_tags = abs(ref_count - det_count) + abs(det_count - det_close_count)
+
+        # Check for "eee" pattern (signature redaction artifact)
+        if "eee" in captured.lower():
+            eee_count = captured.lower().count("eee")
+            if eee_count > 3:
                 logger.warning(
-                    "bbox parse failed for block %d on %s: %s: %s",
-                    len(blocks),
-                    image_path.name,
-                    type(exc).__name__,
-                    exc,
+                    "[MALFORMED] Detected 'eee' pattern (%d occurrences) - likely redacted signatures/watermarks",
+                    eee_count
                 )
 
-            block_type = LABEL_TO_TYPE.get(label, "paragraph")
+    for i, match in enumerate(matches):
+        label = match.group("label").strip()
+        det_text = match.group("det").strip()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(captured)
+        content = captured[start:end].strip()
 
-            if block_type == "table":
-                table_data = try_parse_markdown_table(content)
-                parsed_payload = {"data": table_data, "text": normalize_text(content)}
-            elif block_type == "image":
-                parsed_payload = {"data": None, "text": ""}
-            else:
-                parsed_payload = {"data": None, "text": normalize_text(content)}
+        # Check for corrupted content
+        is_corrupted = (
+            not content or
+            content.startswith("]]<|/det|>") or
+            "eee eee" in content.lower() or
+            len(content) < 2
+        )
 
-            legacy_block = {
-                "id": f"blk_{len(blocks) + 1}",
-                "type": block_type,
-                "order": len(blocks),
-                "bbox": bbox,
-                "extraction_response": content,
-                "extraction_response_parsed": parsed_payload,
-            }
-            blocks.append(legacy_block)
+        if is_corrupted:
+            logger.warning(
+                "[MALFORMED] Block %d has corrupted content: label=%s, content_preview=%s",
+                len(blocks), label, content[:100]
+            )
+
+        try:
+            det_coords = _parse_det(det_text)
+            bbox = _det_to_bbox_normalized(det_coords, img_w, img_h)
+
+            # Additional check: if bbox is all zeros but det_text exists, log detailed info
+            if bbox == [0.0, 0.0, 0.0, 0.0] and det_text:
+                logger.warning(
+                    "[MALFORMED] Zero bbox from det_text=%s | label=%s | content_preview=%s",
+                    det_text[:100], label, content[:50]
+                )
+        except Exception as exc:
+            bbox = [0.0, 0.0, 0.0, 0.0]
+            bbox_parse_failures += 1
+            logger.warning(
+                "bbox parse failed for block %d on %s: %s: %s | det_text=%s",
+                len(blocks),
+                image_path.name,
+                type(exc).__name__,
+                exc,
+                det_text[:100],
+            )
+
+        block_type = LABEL_TO_TYPE.get(label, "paragraph")
+
+        if block_type == "table":
+            table_data = try_parse_markdown_table(content)
+            parsed_payload = {"data": table_data, "text": normalize_text(content)}
+        elif block_type == "image":
+            parsed_payload = {"data": None, "text": ""}
+        else:
+            parsed_payload = {"data": None, "text": normalize_text(content)}
+
+        # BBox overlay expects legacy blocks with id/order.
+        legacy_block = {
+            "id": f"blk_{len(blocks) + 1}",
+            "type": block_type,
+            "order": len(blocks),
+            "bbox": bbox,
+            "extraction_response": content,
+            "extraction_response_parsed": parsed_payload,
+        }
+        blocks.append(legacy_block)
 
     parse_diag = {
         "img_w": img_w,
@@ -840,6 +823,7 @@ def parse_grounded_stdout(
         "match_count": len(matches),
         "block_count": len(blocks),
         "bbox_parse_failures": bbox_parse_failures,
+        "malformed_tags": malformed_tags,
     }
 
     # Return legacy format for bbox overlay, diagnostics, and resolution
@@ -854,17 +838,19 @@ def _has_grounding_tags(text: str) -> bool:
 
 
 def _run_inference(
-        model: Any,
-        tokenizer: Any,
-        image_path: Path,
-        infer_config: Dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    image_path: Path,
+    infer_config: Dict[str, Any],
+    timeout_seconds: int = 180,  # Increased from 60s to prevent truncated outputs
 ) -> Tuple[str, float]:
-    """Run model inference and capture output.
+    """Run model inference and capture output with timeout.
 
     Returns:
         (captured_text, inference_time_sec)
     """
     logger = logging.getLogger("deepseek_ocr")
+
     t0 = time.time()
     out_buf = StringIO()
     err_buf = StringIO()
@@ -872,19 +858,33 @@ def _run_inference(
     prompt = infer_config.get("prompt", PROMPT)
     config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
 
-    # Very verbose config dump (masked prompt preview)
-    meta = {
-        "image": _image_meta(image_path),
-        "prompt_preview": (prompt[:120] + "…") if isinstance(prompt, str) and len(prompt) > 120 else prompt,
-        "infer_kwargs": config_for_infer,
-    }
-    logger.info("[INFER][BEGIN] %s", meta)
+    # Log input image dimensions and model config
+    try:
+        img = Image.open(image_path)
+        img_w, img_h = img.size
+        logger.info(
+            "[INFERENCE] Input: %s (%dx%d px) | Model config: base_size=%s, image_size=%s",
+            image_path.name,
+            img_w,
+            img_h,
+            config_for_infer.get("base_size", "default"),
+            config_for_infer.get("image_size", "default"),
+        )
+    except Exception as e:
+        logger.warning("[INFERENCE] Could not read input image dimensions: %s", e)
+
+    logger.debug("Inference config: %s", {k: v for k, v in config_for_infer.items() if k != "prompt"})
+    logger.debug("Timeout: %ds", timeout_seconds)
 
     res = None
     exception_msg = None
-    with _PerfTimer(logger, "hf.model.infer", page_id=image_path.stem, **{"image": str(image_path)}):
-        with torch.inference_mode():
-            try:
+    timeout_occurred = False
+
+    def _inference_worker():
+        """Worker function to run inference in a thread."""
+        nonlocal res, exception_msg
+        try:
+            with torch.inference_mode():
                 with redirect_stdout(out_buf), redirect_stderr(err_buf):
                     res = model.infer(
                         tokenizer,
@@ -894,41 +894,44 @@ def _run_inference(
                         save_results=False,
                         **config_for_infer,
                     )
-            except Exception as exc:
-                exception_msg = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            exception_msg = f"{type(exc).__name__}: {exc}"
+            logger.error("Inference exception in worker: %s", exception_msg)
+
+    # Start inference in a separate thread
+    logger.debug("Starting model.infer() in background thread with %ds timeout...", timeout_seconds)
+    worker_thread = threading.Thread(target=_inference_worker, daemon=True)
+    worker_thread.start()
+
+    # Wait for completion or timeout
+    worker_thread.join(timeout=timeout_seconds)
+
+    if worker_thread.is_alive():
+        # Thread is still running - timeout occurred
+        timeout_occurred = True
+        exception_msg = f"TimeoutException: Inference exceeded {timeout_seconds}s limit"
+        logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
+        # Note: We can't actually kill the thread, but we can stop waiting for it
+    else:
+        logger.debug("model.infer() completed within timeout")
 
     infer_time = time.time() - t0
+    logger.debug("Inference wall time: %.2fs", infer_time)
 
     captured = ""
     if isinstance(res, str) and res.strip():
         captured = res.strip()
+        logger.debug("Captured from return value: %d chars", len(captured))
     elif out_buf.getvalue().strip():
         captured = out_buf.getvalue().strip()
+        logger.debug("Captured from stdout: %d chars", len(captured))
     elif err_buf.getvalue().strip():
         captured = err_buf.getvalue().strip()
-
-    # Capture sizes and short tails to debug hangs / huge outputs
-    stdout_val = out_buf.getvalue()
-    stderr_val = err_buf.getvalue()
-    logger.info(
-        "[INFER][END] image=%s time=%.3fs res_type=%s captured_chars=%d stdout_chars=%d stderr_chars=%d exception=%s",
-        image_path.name,
-        infer_time,
-        type(res).__name__ if res is not None else None,
-        len(captured),
-        len(stdout_val),
-        len(stderr_val),
-        bool(exception_msg),
-    )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        if stdout_val.strip():
-            logger.debug("[INFER][STDOUT][TAIL] %r", stdout_val[-2000:])
-        if stderr_val.strip():
-            logger.debug("[INFER][STDERR][TAIL] %r", stderr_val[-2000:])
+        logger.debug("Captured from stderr: %d chars", len(captured))
+    else:
+        logger.debug("No output captured")
 
     if exception_msg:
-        logger.error("Inference exception: %s", exception_msg)
         if not captured:
             captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
 
@@ -936,10 +939,10 @@ def _run_inference(
 
 
 def _run_ollama_inference(
-        image_path: Path,
-        logger: logging.Logger,
-        prompt: str,
-        model_name: str = "deepseek-ocr",
+    image_path: Path,
+    logger: logging.Logger,
+    prompt: str,
+    model_name: str = "deepseek-ocr",
 ) -> Tuple[str, float]:
     """Run inference via Ollama HTTP API with an image."""
     t0 = time.time()
@@ -984,20 +987,29 @@ def _run_ollama_inference(
 
 
 def run_page_ocr(
-        model: Any,
-        tokenizer: Any,
-        image_path: Path,
-        infer_config: Dict[str, Any],
-        logger: logging.Logger,
-        page_id: str = "",
-        disable_fallbacks: bool = False,
-        backend: Backend = Backend.HUGGINGFACE,
+    model: Any,
+    tokenizer: Any,
+    image_path: Path,
+    infer_config: Dict[str, Any],
+    logger: logging.Logger,
+    page_id: str = "",
+    disable_fallbacks: bool = False,
+    backend: Backend = Backend.HUGGINGFACE,
+    test_all_modes: bool = False,
+    page_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
-    """Run OCR on a single page image.
+    """Run OCR on a single rendered page image.
+
+    Args:
+        test_all_modes: If True, run all INFERENCE_MODES on this page and log timing.
+        page_dir: Output directory for the page (used for saving mode outputs in test_all_modes)
 
     Returns:
         (page_ocr, inference_time_sec, attempt_used, resolution)
     """
+    if test_all_modes and backend == Backend.HUGGINGFACE:
+        return _run_all_modes_experiment(model, tokenizer, image_path, logger, page_id, page_dir)
+
     if backend == Backend.OLLAMA:
         logger.info("[%s] Inference (ollama)", page_id)
         prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
@@ -1055,6 +1067,196 @@ def run_page_ocr(
     return {"ocr": {"blocks": []}}, time_base, "none", resolution
 
 
+def _run_all_modes_experiment(
+    model: Any,
+    tokenizer: Any,
+    image_path: Path,
+    logger: logging.Logger,
+    page_id: str,
+    page_dir: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], float, str, List[int]]:
+    """Run all inference modes on a page and log timing results.
+
+    Returns the result from the first successful mode.
+    """
+    logger.info("[%s] === RUNNING ALL MODES EXPERIMENT ===", page_id)
+    logger.info("[%s] Image path: %s", page_id, image_path)
+
+    img = Image.open(image_path).convert("RGB")
+    resolution = [img.size[0], img.size[1]]
+    logger.info("[%s] Image resolution: %dx%d", page_id, resolution[0], resolution[1])
+
+    # Create output directory for raw outputs
+    # Use persistent directory under page_dir if provided
+    if page_dir is not None:
+        mode_out_dir = page_dir / "mode_outputs"
+    else:
+        mode_out_dir = image_path.parent / f"{page_id.replace('|', '_')}_mode_outputs"
+
+    mode_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Log CWD to make debugging easier
+    logger.info("[%s] CWD=%s", page_id, os.getcwd())
+    logger.info("[%s] Raw outputs will be saved to: %s", page_id, str(mode_out_dir.resolve()))
+
+    results = []
+    first_success = None
+    total_time = 0.0
+
+    for idx, (mode_name, mode_config) in enumerate(INFERENCE_MODES.items(), 1):
+        logger.info("[%s] " + "="*60, page_id)
+        logger.info("[%s] Testing mode %d/%d: %s", page_id, idx, len(INFERENCE_MODES), mode_name)
+        logger.debug("[%s]   base_size: %d", page_id, mode_config.get("base_size", 1024))
+        logger.debug("[%s]   image_size: %d", page_id, mode_config.get("image_size", 640))
+        logger.debug("[%s]   crop_mode: %s", page_id, mode_config.get("crop_mode", False))
+        prompt_text = mode_config.get("prompt", "")
+        if len(prompt_text) > 100:
+            logger.debug("[%s]   prompt: %s...", page_id, prompt_text[:100])
+        else:
+            logger.debug("[%s]   prompt: %s", page_id, prompt_text)
+
+        test_config = dict(mode_config)
+
+        try:
+            logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
+            t_start = time.time()
+            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=60)
+            t_end = time.time()
+            total_time += infer_time
+
+            logger.debug("[%s] Inference completed in %.2fs (wall time: %.2fs)", page_id, infer_time, t_end - t_start)
+
+            success = _has_grounding_tags(captured)
+            char_count = len(captured)
+
+            # Count grounding tags
+            ref_count = captured.count("<|ref|>") if captured else 0
+            det_count = captured.count("<|det|>") if captured else 0
+
+            logger.debug("[%s] Output length: %d chars", page_id, char_count)
+            logger.debug("[%s] Grounding tags found: <|ref|>=%d, <|det|>=%d", page_id, ref_count, det_count)
+
+            # Save raw output
+            raw_output_file = mode_out_dir / f"{mode_name}.txt"
+            raw_output_file.write_text(captured if captured else "[EMPTY OUTPUT]", encoding="utf-8")
+            logger.debug("[%s] Raw output saved to: %s", page_id, raw_output_file.name)
+
+            # Parse and save bbox image for successful modes
+            mode_blocks = []
+            if success:
+                try:
+                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger)
+                    mode_blocks = parsed_ocr.get("ocr", {}).get("blocks", [])
+
+                    # Save bbox image for this mode
+                    bbox_img_path = mode_out_dir / f"{mode_name}_bbox.png"
+                    save_bbox_image(image_path, mode_blocks, bbox_img_path)
+                    logger.debug("[%s] Bbox image saved for mode %s: %d blocks", page_id, mode_name, len(mode_blocks))
+                except Exception as bbox_exc:
+                    logger.warning("[%s] Failed to save bbox for mode %s: %s", page_id, mode_name, bbox_exc)
+
+            # Save parsed JSON result
+            mode_result = {
+                "mode": mode_name,
+                "success": success,
+                "char_count": char_count,
+                "ref_tag_count": ref_count,
+                "det_tag_count": det_count,
+                "block_count": len(mode_blocks),
+            }
+            json_output_file = mode_out_dir / f"{mode_name}.json"
+            json_output_file.write_text(
+                json.dumps(mode_result, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+
+            result_entry = {
+                "mode": mode_name,
+                "time_sec": round(infer_time, 2),
+                "success": success,
+                "char_count": char_count,
+                "ref_tag_count": ref_count,
+                "det_tag_count": det_count,
+                "block_count": len(mode_blocks),
+                "base_size": mode_config.get("base_size", 1024),
+                "image_size": mode_config.get("image_size", 640),
+                "prompt": mode_config.get("prompt", ""),
+                "raw_output_file": str(raw_output_file.name),
+                "bbox_image": f"{mode_name}_bbox.png" if success else None,
+            }
+            results.append(result_entry)
+
+            status = "✓ SUCCESS" if success else "✗ FAILED"
+            if success:
+                logger.info("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d | blocks=%d",
+                           page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count, len(mode_blocks))
+            else:
+                logger.warning("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d",
+                              page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count)
+
+            if success and first_success is None:
+                logger.info("[%s] First successful mode: %s", page_id, mode_name)
+                page_ocr_dict = {"ocr": {"blocks": mode_blocks}}
+                first_success = (page_ocr_dict, result_entry["mode"])
+
+        except Exception as exc:
+            logger.error("[%s] Mode %s exception: %s: %s", page_id, mode_name, type(exc).__name__, exc)
+            import traceback
+            logger.debug("[%s] Traceback:\n%s", page_id, traceback.format_exc())
+            results.append({
+                "mode": mode_name,
+                "time_sec": 0.0,
+                "success": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            })
+
+    # Log summary
+    logger.info("[%s] " + "="*60, page_id)
+    logger.info("[%s] === EXPERIMENT SUMMARY ===", page_id)
+    logger.info("[%s] Total modes tested: %d", page_id, len(results))
+    logger.info("[%s] Total time: %.1fs (%.1f min)", page_id, total_time, total_time / 60)
+
+    successful = [r for r in results if r.get("success", False)]
+    failed = [r for r in results if not r.get("success", False)]
+
+    if successful:
+        logger.info("[%s] Successful modes: %d / %d", page_id, len(successful), len(results))
+        fastest = min(successful, key=lambda x: x["time_sec"])
+        slowest = max(successful, key=lambda x: x["time_sec"])
+        logger.info("[%s] Fastest: %s (%.1fs)", page_id, fastest["mode"], fastest["time_sec"])
+        logger.info("[%s] Slowest: %s (%.1fs)", page_id, slowest["mode"], slowest["time_sec"])
+        logger.info("[%s] Speed ratio: %.1fx", page_id, slowest["time_sec"] / fastest["time_sec"])
+    else:
+        logger.warning("[%s] No modes succeeded! All %d modes failed.", page_id, len(failed))
+
+    if failed:
+        logger.warning("[%s] Failed modes: %d", page_id, len(failed))
+        for r in failed:
+            if "error" in r:
+                logger.debug("[%s]   - %s: %s", page_id, r["mode"], r.get("error", "unknown"))
+
+    # Save results to JSON (in mode_out_dir)
+    results_file = mode_out_dir / "mode_comparison.json"
+    results_file.write_text(json.dumps({
+        "page_id": page_id,
+        "image_path": str(image_path),
+        "resolution": resolution,
+        "total_time_sec": round(total_time, 2),
+        "successful_count": len(successful),
+        "failed_count": len(failed),
+        "results": results,
+    }, indent=2), encoding="utf-8")
+    logger.info("[%s] Mode comparison JSON saved to: %s", page_id, str(results_file.resolve()))
+    logger.info("[%s] " + "="*60, page_id)
+
+    if first_success:
+        page_ocr, mode_used = first_success
+        return page_ocr, total_time, f"experiment_{mode_used}", resolution
+    else:
+        return {"ocr": {"blocks": []}}, total_time, "experiment_none", resolution
+
+
 def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path: Path) -> None:
     """Draw bounding boxes on page image and save."""
     from PIL import ImageDraw
@@ -1062,16 +1264,37 @@ def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path
     img = Image.open(page_img_path).convert("RGB")
     img_w, img_h = img.size
     draw = ImageDraw.Draw(img)
+
     for blk in blocks:
         bbox = blk.get("bbox")
         if not (isinstance(bbox, list) and len(bbox) == 4):
             continue
+
         norm_x, norm_y, norm_w, norm_h = bbox
-        x = int(norm_x * img_w)
-        y = int(norm_y * img_h)
-        w = int(norm_w * img_w)
-        h = int(norm_h * img_h)
-        draw.rectangle([x, y, x + w, y + h], outline="red", width=2)
+
+        # Calculate corners with rounding (not truncation) for accuracy
+        x1 = int(round(norm_x * img_w))
+        y1 = int(round(norm_y * img_h))
+        x2 = int(round((norm_x + norm_w) * img_w))
+        y2 = int(round((norm_y + norm_h) * img_h))
+
+        # Clamp to image bounds to prevent out-of-bounds drawing
+        x1 = max(0, min(img_w - 1, x1))
+        y1 = max(0, min(img_h - 1, y1))
+        x2 = max(0, min(img_w, x2))
+        y2 = max(0, min(img_h, y2))
+
+        # Ensure at least 1 pixel wide/tall (prevents zero-size boxes)
+        if x2 <= x1:
+            x2 = min(img_w, x1 + 1)
+        if y2 <= y1:
+            y2 = min(img_h, y1 + 1)
+
+        # Draw rectangle (skip if still invalid)
+        try:
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+        except Exception:
+            pass
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(dest_path)
@@ -1082,53 +1305,19 @@ def _copy_image(src: Path, dst: Path) -> None:
     Image.open(src).convert("RGB").save(dst)
 
 
-def gather_inputs(input_arg: Path) -> List[Path]:
-    """Gather input files from a file or directory (PDFs and supported images)."""
-    if input_arg.is_file():
-        return [input_arg]
-    if input_arg.is_dir():
-        candidates: List[Path] = []
-        for path in sorted(input_arg.rglob("*")):
-            if path.is_file() and (is_pdf(path) or is_image(path)):
-                candidates.append(path)
-        return candidates
-    raise FileNotFoundError(f"Input not found: {input_arg}")
-
-
-def parse_page_selection(pages: Optional[List[int]], page_range: Optional[str], total_pages: int) -> List[int]:
-    """Parse page selection flags into 0-based indices."""
-
-    def normalize(idx: int) -> int:
-        return idx - 1
-
-    if pages:
-        return [normalize(p) for p in pages if 1 <= p <= total_pages]
-    if page_range:
-        try:
-            start_s, end_s = page_range.split("-")
-            start, end = int(start_s), int(end_s)
-            start = max(start, 1)
-            end = min(end, total_pages)
-            if start <= end:
-                return list(range(normalize(start), normalize(end) + 1))
-        except ValueError:
-            pass
-    return list(range(total_pages))
-
-
 def process_document(
-        model: Any,
-        tokenizer: Any,
-        input_path: Path,
-        cfg: Config,
-        output_root: Path,
-        selection_label: str,
-        logger: logging.Logger,
-        pages: Optional[List[int]] = None,
-        page_range: Optional[str] = None,
-        backend: Backend = Backend.HUGGINGFACE,
-        inference_config: Optional[Dict[str, Any]] = None,
-        legacy_document_json: bool = False,
+    model: Any,
+    tokenizer: Any,
+    input_path: Path,
+    cfg: Config,
+    output_root: Path,
+    selection_label: str,
+    logger: logging.Logger,
+    pages: Optional[List[int]] = None,
+    page_range: Optional[str] = None,
+    backend: Backend = Backend.HUGGINGFACE,
+    inference_config: Optional[Dict[str, Any]] = None,
+    legacy_document_json: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Process one input document and write per-page outputs.
 
@@ -1151,11 +1340,17 @@ def process_document(
             pdf_doc.close()
 
             selected_indices = parse_page_selection(pages, page_range, total_pages)
-            with _PerfTimer(logger, "pdf.render_selected", page_id=input_path.stem, pages=len(selected_indices),
-                            dpi=cfg.dpi):
-                page_image_paths = render_pdf_to_images(
-                    input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
-                )
+
+            # Create debug directory for transformation images if debug is enabled
+            debug_transforms_dir = None
+            if cfg.debug_keep_renders:
+                debug_transforms_dir = selection_dir / "debug_transforms"
+                debug_transforms_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Debug mode: Saving intermediate transformation images to %s", debug_transforms_dir)
+
+            page_image_paths = render_pdf_to_images(
+                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices, debug_save_dir=debug_transforms_dir, disable_downscale=cfg.disable_downscale
+            )
         else:
             page_image_paths = [input_path]
             selected_indices = parse_page_selection(pages, page_range, len(page_image_paths))
@@ -1176,49 +1371,89 @@ def process_document(
 
             page_id = f"{input_path.stem}|P{page_index + 1:03d}"
 
-            logger.info("[%s] Page start: image=%s meta=%s", page_id, page_path.name, _image_meta(page_path))
-
             if cfg.debug_keep_renders:
-                with _PerfTimer(logger, "page.persist_render", page_id=page_id):
-                    try:
-                        _copy_image(page_path, page_dir / "render.png")
-                    except Exception as exc:
-                        logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
+                try:
+                    _copy_image(page_path, page_dir / "render.png")
+                except Exception as exc:
+                    logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
 
             try:
-                with _PerfTimer(logger, "page.run_page_ocr", page_id=page_id, backend=str(cfg.backend)):
-                    page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image_path=page_path,
-                        infer_config=infer_config,
-                        logger=logger,
-                        page_id=page_id,
-                        disable_fallbacks=cfg.disable_fallbacks,
-                        backend=cfg.backend,
-                    )
+                page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
+                    model=model,
+                    tokenizer=tokenizer,
+                    image_path=page_path,
+                    infer_config=infer_config,
+                    logger=logger,
+                    page_id=page_id,
+                    disable_fallbacks=cfg.disable_fallbacks,
+                    backend=cfg.backend,
+                    test_all_modes=cfg.test_all_modes,
+                    page_dir=page_dir,
+                )
 
                 if cfg.save_bbox_overlay:
-                    with _PerfTimer(logger, "page.save_bbox_overlay", page_id=page_id):
-                        try:
-                            save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []),
-                                            page_dir / "page_bbox.png")
-                        except Exception as exc:
-                            logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
+                    try:
+                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
+                    except Exception as exc:
+                        logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
+
+                # Analyze bbox distribution for edge detection issues
+                try:
+                    bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
+                    bbox_analysis_path = page_dir / "bbox_analysis.json"
+                    bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+                    logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
+                except Exception as exc:
+                    logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
 
+                # Apply heuristic header/footer classification
+                raw_blocks = page_ocr.get("ocr", {}).get("blocks", [])
+                classified_blocks = classify_header_footer_heuristic(raw_blocks, logger)
+
                 spec_blocks: List[Dict[str, Any]] = []
-                for blk in page_ocr.get("ocr", {}).get("blocks", []):
+                dropped_header_footer_count = 0
+                dropped_low_confidence_count = 0
+
+                for blk in classified_blocks:
+                    block_type = blk.get("type", "paragraph")
+                    bbox = blk.get("bbox", [0, 0, 0, 0])
+
+                    # Skip header/footer if flag is enabled
+                    if cfg.drop_header_footer and block_type in ["page-header", "page-footer"]:
+                        dropped_header_footer_count += 1
+                        continue
+
+                    # Skip zero bboxes if flag is enabled
+                    if cfg.skip_low_confidence and bbox == [0.0, 0.0, 0.0, 0.0]:
+                        dropped_low_confidence_count += 1
+                        logger.debug(
+                            "[%s] Skipping low-confidence block (zero bbox): type=%s, text=%s",
+                            page_id, block_type, blk.get("extraction_response", "")[:50]
+                        )
+                        continue
+
                     spec_blocks.append(
                         {
-                            "type": blk["type"],
-                            "bbox": blk["bbox"],
+                            "type": block_type,
+                            "bbox": bbox,
                             "extraction_origin": blk.get("extraction_origin", "deepseek-ocr"),
                             "extraction_response": blk["extraction_response"],
                             "extraction_response_parsed": blk["extraction_response_parsed"],
                         }
+                    )
+
+                if dropped_header_footer_count > 0:
+                    logger.info(
+                        "[%s] Dropped %d header/footer blocks (--drop-header-footer enabled)",
+                        page_id, dropped_header_footer_count
+                    )
+                if dropped_low_confidence_count > 0:
+                    logger.info(
+                        "[%s] Dropped %d low-confidence blocks (--skip-low-confidence enabled)",
+                        page_id, dropped_low_confidence_count
                     )
 
                 page_warnings: List[str] = []
@@ -1238,19 +1473,9 @@ def process_document(
                     warnings=page_warnings if page_warnings else None,
                 )
 
-                with _PerfTimer(logger, "page.write_json", page_id=page_id,
-                                out=str(selection_dir / f"page_{page_index + 1}.json")):
-                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-                logger.info(
-                    "[%s] Page done: attempt=%s blocks=%d infer_time=%.3fs resolution=%s",
-                    page_id,
-                    attempt_used,
-                    len(spec_blocks),
-                    infer_time,
-                    resolution,
-                )
+                page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.debug("[%s] wrote %s", page_id, page_json_path.name)
 
                 page_payload = {
                     "meta": {
@@ -1289,10 +1514,8 @@ def process_document(
                     blocks=[],
                     warnings=error_warnings,
                 )
-                with _PerfTimer(logger, "page.write_json.error", page_id=page_id,
-                                out=str(selection_dir / f"page_{page_index + 1}.json")):
-                    page_json_path = selection_dir / f"page_{page_index + 1}.json"
-                    page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 page_payload = {
                     "meta": {
@@ -1358,13 +1581,25 @@ def process_document(
     return doc_json, summary
 
 
+def gather_inputs(input_arg: Path) -> List[Path]:
+    if input_arg.is_file():
+        return [input_arg]
+    if input_arg.is_dir():
+        candidates = []
+        for path in sorted(input_arg.rglob("*")):
+            if path.is_file() and (is_pdf(path) or is_image(path)):
+                candidates.append(path)
+        return candidates
+    raise FileNotFoundError(f"Input not found: {input_arg}")
+
+
 def write_run_summary(
-        eval_dir: Path,
-        run_items: List[Dict[str, Any]],
-        total_time: float,
-        total_pages: int,
-        device: str,
-        model: str,
+    eval_dir: Path,
+    run_items: List[Dict[str, Any]],
+    total_time: float,
+    total_pages: int,
+    device: str,
+    model: str,
 ) -> Path:
     eval_dir.mkdir(parents=True, exist_ok=True)
     ts_filename = time.strftime("%Y%m%d_%H%M%S")
@@ -1387,17 +1622,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek-OCR pipeline")
     parser.add_argument("--input", required=True, help="Path to a PDF, image, or folder of files")
     parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
-    parser.add_argument("--eval-output-dir", default="./evaluation_output",
-                        help="Directory for evaluation run summaries (default: ./evaluation_output)")
     parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
     parser.add_argument("--revision", default=None, help="Optional model revision")
     parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
     parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Console log level")
-    parser.add_argument("--keep-renders", action="store_true",
-                        help="Persist rendered page images under page folders (recommended)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level")
+    parser.add_argument("--keep-renders", action="store_true", help="Persist rendered page images under page folders (recommended)")
     parser.add_argument(
         "--no-bbox-overlay",
         action="store_true",
@@ -1414,8 +1645,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="[DEPRECATED] Use --enable-fallbacks instead. Fallbacks are now disabled by default.",
     )
-    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend],
-                        help="Backend: huggingface or ollama")
+    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend], help="Backend: huggingface or ollama")
     parser.add_argument(
         "--mode",
         default="extract_all",
@@ -1423,37 +1653,64 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Inference mode with optimized settings (extract_all is default)",
     )
     parser.add_argument(
-        "--modes",
-        nargs="+",
-        choices=list(INFERENCE_MODES.keys()),
-        default=None,
-        help="Run multiple modes (space-separated). Overrides --mode when used.",
-    )
-    parser.add_argument(
-        "--run-modes-per-page",
-        action="store_true",
-        default=False,
-        help="If set, run each selected mode for each selected page and save into per-mode output folders.",
-    )
-    parser.add_argument(
         "--prompt",
         default=None,
         help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
     )
-    parser.add_argument("--test-compress", action="store_true",
-                        help="Enable test_compress mode for compression diagnostics")
+    parser.add_argument("--test-compress", action="store_true", help="Enable test_compress mode for compression diagnostics")
     parser.add_argument("--base-size", type=int, default=None, help="Override base_size (e.g., 512, 768, 1024, 1280)")
-    parser.add_argument("--image-size", type=int, default=None,
-                        help="Override image_size (e.g., 384, 512, 640, 768, 896)")
-    parser.add_argument("--max-new-tokens", type=int, default=None,
-                        help="Maximum tokens to generate (default: model default)")
+    parser.add_argument("--image-size", type=int, default=None, help="Override image_size (e.g., 384, 512, 640, 768, 896)")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Maximum tokens to generate (default: model default)")
     parser.add_argument(
         "--legacy-document-json",
         action="store_true",
         default=False,
         help="Write legacy document.json in addition to per-page spec files (default: OFF)",
     )
+    parser.add_argument(
+        "--test-all-modes",
+        action="store_true",
+        default=False,
+        help="Run all inference modes on each page with 3-minute timeout per mode (for debugging slowdowns)",
+    )
+    parser.add_argument(
+        "--drop-header-footer",
+        action="store_true",
+        default=False,
+        help="Filter out page-header and page-footer blocks from output (requires heuristic classification)",
+    )
+    parser.add_argument(
+        "--skip-low-confidence",
+        action="store_true",
+        default=False,
+        help="Skip blocks with zero bboxes (likely from malformed model output)",
+    )
+    parser.add_argument(
+        "--disable-downscale",
+        action="store_true",
+        default=False,
+        help="Disable MAX_IMAGE_DIMENSION downscaling (keeps full resolution for edge detection testing)",
+    )
     return parser.parse_args(argv)
+
+
+def parse_page_selection(pages: Optional[List[int]], page_range: Optional[str], total_pages: int) -> List[int]:
+    def normalize(idx: int) -> int:
+        return idx - 1
+
+    if pages:
+        return [normalize(p) for p in pages if 1 <= p <= total_pages]
+    if page_range:
+        try:
+            start_s, end_s = page_range.split("-")
+            start, end = int(start_s), int(end_s)
+            start = max(start, 1)
+            end = min(end, total_pages)
+            if start <= end:
+                return list(range(normalize(start), normalize(end) + 1))
+        except ValueError:
+            pass
+    return list(range(total_pages))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1470,11 +1727,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         backend=backend,
         dpi=args.dpi,
         out_dir=args.output_dir,
-        eval_out_dir=args.eval_output_dir,
         log_level=args.log_level,
         debug_keep_renders=bool(args.keep_renders),
         save_bbox_overlay=not args.no_bbox_overlay,
         disable_fallbacks=not args.enable_fallbacks if not args.disable_fallbacks else args.disable_fallbacks,
+        test_all_modes=args.test_all_modes,
+        drop_header_footer=args.drop_header_footer,
+        skip_low_confidence=args.skip_low_confidence,
+        disable_downscale=args.disable_downscale,
     )
     ds_cfg = DeepSeekConfig(device=resolved_device, revision=args.revision)
 
@@ -1490,17 +1750,44 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     model, tokenizer = build_model(cfg.model, resolved_device, ds_cfg.revision, logger, backend=backend)
 
-    # Determine which modes we will run.
-    # If --run-modes-per-page is set and --modes is not provided, run ALL modes.
-    if args.modes:
-        modes_to_run = args.modes
-    elif args.run_modes_per_page:
-        modes_to_run = list(INFERENCE_MODES.keys())
-    else:
-        modes_to_run = [args.mode]
+    inference_config = INFERENCE_MODES.get(args.mode, INFERENCE_MODES["extract_all"]).copy()
 
-    if args.run_modes_per_page:
-        logger.info("Modes-per-page enabled; modes=%s", modes_to_run)
+    if args.prompt is not None:
+        inference_config["prompt"] = args.prompt
+        logger.info("Prompt: custom (--prompt)")
+    else:
+        logger.info("Prompt: mode default (%s)", args.mode)
+
+    if args.test_compress:
+        inference_config["test_compress"] = True
+        logger.info("test_compress enabled")
+
+    if args.base_size:
+        inference_config["base_size"] = args.base_size
+        logger.info("base_size overridden to %d", args.base_size)
+    if args.image_size:
+        inference_config["image_size"] = args.image_size
+        logger.info("image_size overridden to %d", args.image_size)
+    if args.max_new_tokens:
+        inference_config["max_new_tokens"] = args.max_new_tokens
+        logger.info("max_new_tokens set to %d", args.max_new_tokens)
+
+    if cfg.disable_fallbacks:
+        logger.info("Crop mode fallback: disabled")
+    else:
+        logger.info("Crop mode fallback: enabled")
+
+    logger.info(
+        "Mode: %s (base_size=%s, image_size=%s)",
+        args.mode,
+        inference_config.get("base_size"),
+        inference_config.get("image_size"),
+    )
+
+    if args.legacy_document_json:
+        logger.info("Legacy document.json output: enabled")
+    else:
+        logger.info("Legacy document.json output: disabled")
 
     out_dir = Path(cfg.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1512,93 +1799,46 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_start = time.time()
     for input_file in inputs:
-        base_selection_label = "all_pages"
+        selection_label = "all_pages"
         if args.pages:
-            base_selection_label = "pages_" + "-".join(map(str, args.pages))
+            selection_label = "pages_" + "-".join(map(str, args.pages))
         elif args.page_range:
-            base_selection_label = f"pages_{args.page_range}"
+            selection_label = f"pages_{args.page_range}"
 
-        for mode_name in modes_to_run:
-            inference_config = INFERENCE_MODES.get(mode_name, INFERENCE_MODES["extract_all"]).copy()
+        doc_root = out_dir / input_file.stem
+        doc_root.mkdir(parents=True, exist_ok=True)
 
-            # Allow global overrides even in multi-mode runs
-            if args.prompt is not None:
-                inference_config["prompt"] = args.prompt
-                logger.info("Prompt: custom (--prompt) [mode=%s]", mode_name)
-            else:
-                logger.info("Prompt: mode default (%s)", mode_name)
+        logger.info("Processing document: %s (selection=%s)", input_file.name, selection_label)
 
-            if args.test_compress:
-                inference_config["test_compress"] = True
-                logger.info("test_compress enabled [mode=%s]", mode_name)
+        doc_json, summary = process_document(
+            model,
+            tokenizer,
+            input_file,
+            cfg,
+            output_root=doc_root,
+            selection_label=selection_label,
+            logger=logger,
+            pages=args.pages,
+            page_range=args.page_range,
+            inference_config=inference_config,
+            legacy_document_json=args.legacy_document_json,
+        )
 
-            if args.base_size:
-                inference_config["base_size"] = args.base_size
-                logger.info("base_size overridden to %d [mode=%s]", args.base_size, mode_name)
-            if args.image_size:
-                inference_config["image_size"] = args.image_size
-                logger.info("image_size overridden to %d [mode=%s]", args.image_size, mode_name)
-            if args.max_new_tokens:
-                inference_config["max_new_tokens"] = args.max_new_tokens
-                logger.info("max_new_tokens set to %d [mode=%s]", args.max_new_tokens, mode_name)
+        selection_dir = doc_root / selection_label
+        out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
 
-            if cfg.disable_fallbacks:
-                logger.info("Crop mode fallback: disabled")
-            else:
-                logger.info("Crop mode fallback: enabled")
-
-            logger.info(
-                "Mode: %s (base_size=%s, image_size=%s)",
-                mode_name,
-                inference_config.get("base_size"),
-                inference_config.get("image_size"),
-            )
-
-            if args.legacy_document_json:
-                logger.info("Legacy document.json output: enabled")
-            else:
-                logger.info("Legacy document.json output: disabled")
-
-            # Separate results by mode when running a grid.
-            selection_label = base_selection_label
-            if args.run_modes_per_page and len(modes_to_run) > 1:
-                selection_label = f"{base_selection_label}__mode_{mode_name}"
-
-            doc_root = out_dir / input_file.stem
-            doc_root.mkdir(parents=True, exist_ok=True)
-
-            logger.info("Processing document: %s (selection=%s)", input_file.name, selection_label)
-
-            doc_json, summary = process_document(
-                model,
-                tokenizer,
-                input_file,
-                cfg,
-                output_root=doc_root,
-                selection_label=selection_label,
-                logger=logger,
-                pages=args.pages,
-                page_range=args.page_range,
-                inference_config=inference_config,
-                legacy_document_json=args.legacy_document_json,
-            )
-
-            selection_dir = doc_root / selection_label
-            out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
-
-            run_items.append(
-                {
-                    "input_file": str(input_file),
-                    "output_file": str(out_path),
-                    "mode": mode_name,
-                    "pages": summary["total_pages"],
-                    "total_time_sec": summary["total_time_sec"],
-                    "avg_time_per_page_sec": summary["avg_time_per_page_sec"],
-                    "page_timings": summary["page_timings"],
-                }
-            )
-            grand_total_time += summary["total_time_sec"]
-            total_pages += summary["total_pages"]
+        run_items.append(
+            {
+                "input_file": str(input_file),
+                "output_file": str(out_path),
+                "pages": summary["total_pages"],
+                "total_time_sec": summary["total_time_sec"],
+                "avg_time_per_page_sec": summary["avg_time_per_page_sec"],
+                "page_timings": summary["page_timings"],
+            }
+        )
+        grand_total_time += summary["total_time_sec"]
+        total_pages += summary["total_pages"]
 
     run_total_time = time.time() - run_start
     summary_path = write_run_summary(
@@ -1614,6 +1854,102 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Run summary saved to %s", summary_path)
     logger.info("Elapsed wall time: %.2fs (model load included)", run_total_time)
     return 0
+
+
+
+def analyze_bbox_distribution(blocks: List[Dict[str, Any]], logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+    """Analyze spatial distribution of bounding boxes to detect edge text detection issues.
+
+    Returns:
+        Statistics dict with y-coordinate distribution, edge zone coverage, etc.
+    """
+    if not blocks:
+        return {
+            "block_count": 0,
+            "error": "No blocks to analyze"
+        }
+
+    y_coords = []
+    x_coords = []
+    top_edge_blocks = 0  # y < 0.15
+    bottom_edge_blocks = 0  # y > 0.85
+    left_edge_blocks = 0  # x < 0.15
+    right_edge_blocks = 0  # x > 0.85
+
+    for blk in blocks:
+        bbox = blk.get("bbox")
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+
+        # bbox is [x, y, width, height] in normalized 0-1 coordinates
+        x, y, w, h = bbox
+        y_coords.append(y)
+        x_coords.append(x)
+
+        # Check edge zones
+        if y < 0.15:
+            top_edge_blocks += 1
+        if y + h > 0.85:
+            bottom_edge_blocks += 1
+        if x < 0.15:
+            left_edge_blocks += 1
+        if x + w > 0.85:
+            right_edge_blocks += 1
+
+    if not y_coords:
+        return {
+            "block_count": len(blocks),
+            "error": "No valid bboxes found"
+        }
+
+    stats = {
+        "block_count": len(blocks),
+        "valid_bboxes": len(y_coords),
+        "y_distribution": {
+            "min": round(min(y_coords), 4),
+            "max": round(max(y_coords), 4),
+            "mean": round(sum(y_coords) / len(y_coords), 4),
+            "median": round(sorted(y_coords)[len(y_coords) // 2], 4),
+        },
+        "x_distribution": {
+            "min": round(min(x_coords), 4),
+            "max": round(max(x_coords), 4),
+            "mean": round(sum(x_coords) / len(x_coords), 4),
+        },
+        "edge_coverage": {
+            "top_edge_blocks": top_edge_blocks,
+            "bottom_edge_blocks": bottom_edge_blocks,
+            "left_edge_blocks": left_edge_blocks,
+            "right_edge_blocks": right_edge_blocks,
+            "top_edge_pct": round((top_edge_blocks / len(y_coords)) * 100, 1) if y_coords else 0,
+            "bottom_edge_pct": round((bottom_edge_blocks / len(y_coords)) * 100, 1) if y_coords else 0,
+        },
+        "warnings": []
+    }
+
+    # Add warnings for potential issues
+    if top_edge_blocks == 0 and len(blocks) > 3:
+        stats["warnings"].append("No blocks detected in top 15% of page (potential missing header)")
+    if bottom_edge_blocks == 0 and len(blocks) > 3:
+        stats["warnings"].append("No blocks detected in bottom 15% of page (potential missing footer)")
+    if stats["y_distribution"]["min"] > 0.10:
+        stats["warnings"].append(f"First block starts at y={stats['y_distribution']['min']:.3f} (>10% from top)")
+    if stats["y_distribution"]["max"] < 0.90:
+        stats["warnings"].append(f"Last block ends before y={stats['y_distribution']['max']:.3f} (<90% down page)")
+
+    if logger:
+        logger.info("[BBOX_ANALYSIS] %d blocks | y: %.3f-%.3f | Top edge: %d (%.1f%%) | Bottom edge: %d (%.1f%%)",
+                   len(blocks),
+                   stats["y_distribution"]["min"],
+                   stats["y_distribution"]["max"],
+                   top_edge_blocks,
+                   stats["edge_coverage"]["top_edge_pct"],
+                   bottom_edge_blocks,
+                   stats["edge_coverage"]["bottom_edge_pct"])
+        for warning in stats["warnings"]:
+            logger.warning("[BBOX_ANALYSIS] %s", warning)
+
+    return stats
 
 
 if __name__ == "__main__":
