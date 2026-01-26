@@ -235,7 +235,7 @@ class Config:
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
-    eval_out_dir: str = "./evaluation_output"
+    eval_out_dir: str = "/content/drive/MyDrive/LSExtractor/evaluation_output/deepseek_ocr"
     log_level: str = "INFO"
     debug_keep_renders: bool = True
     save_bbox_overlay: bool = True
