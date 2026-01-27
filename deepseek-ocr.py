@@ -235,14 +235,12 @@ class Config:
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
-    eval_out_dir: str = "/content/drive/MyDrive/LSExtractor/evaluation_output/deepseek_ocr"
+    eval_out_dir: str = "./evaluation_output"
     log_level: str = "INFO"
     debug_keep_renders: bool = True
     save_bbox_overlay: bool = True
     disable_fallbacks: bool = False
     test_all_modes: bool = False  # Run all inference modes on each page
-    drop_header_footer: bool = False  # Filter out page-header and page-footer blocks
-    skip_low_confidence: bool = False  # Skip blocks with zero bboxes (likely malformed)
     disable_downscale: bool = False  # Disable MAX_IMAGE_DIMENSION downscaling for edge detection testing
 
 
@@ -450,7 +448,7 @@ def _parse_det(det_text: str):
 
 
 def _det_to_bbox_normalized(det_coords, img_w: int, img_h: int) -> List[float]:
-    """Convert detection coordinates to normalized bbox [x, y, width, height] in 0-1 range."""
+    """Convert detection coordinates to normalized bbox [x1, y1, x2, y2] in 0-1 range."""
     if not det_coords or not isinstance(det_coords, list):
         return [0.0, 0.0, 0.0, 0.0]
 
@@ -473,16 +471,16 @@ def _det_to_bbox_normalized(det_coords, img_w: int, img_h: int) -> List[float]:
     px2 = max(0, min(px2, img_w))
     py2 = max(0, min(py2, img_h))
 
-    norm_x = px1 / img_w if img_w > 0 else 0.0
-    norm_y = py1 / img_h if img_h > 0 else 0.0
-    norm_w = (px2 - px1) / img_w if img_w > 0 else 0.0
-    norm_h = (py2 - py1) / img_h if img_h > 0 else 0.0
+    norm_x1 = px1 / img_w if img_w > 0 else 0.0
+    norm_y1 = py1 / img_h if img_h > 0 else 0.0
+    norm_x2 = px2 / img_w if img_w > 0 else 0.0
+    norm_y2 = py2 / img_h if img_h > 0 else 0.0
 
     return [
-        max(0.0, min(1.0, norm_x)),
-        max(0.0, min(1.0, norm_y)),
-        max(0.0, min(1.0, norm_w)),
-        max(0.0, min(1.0, norm_h)),
+        max(0.0, min(1.0, norm_x1)),
+        max(0.0, min(1.0, norm_y1)),
+        max(0.0, min(1.0, norm_x2)),
+        max(0.0, min(1.0, norm_y2)),
     ]
 
 
@@ -532,9 +530,13 @@ def classify_header_footer_heuristic(
             updated_blocks.append(block)
             continue
 
-        x, y, w, h = bbox
+        x1, y1, x2, y2 = bbox
         block_type = block.get("type", "paragraph")
         text = block.get("extraction_response", "")
+
+        # Calculate width and height for heuristics
+        w = x2 - x1
+        h = y2 - y1
 
         # Skip blocks with zero bbox (corrupted/malformed output)
         if bbox == [0.0, 0.0, 0.0, 0.0]:
@@ -557,8 +559,8 @@ def classify_header_footer_heuristic(
             continue
 
         # Check position-based heuristics
-        is_top_region = y < HEADER_THRESHOLD
-        is_bottom_region = (y + h) > FOOTER_THRESHOLD
+        is_top_region = y1 < HEADER_THRESHOLD
+        is_bottom_region = y2 > FOOTER_THRESHOLD
         is_small_height = h < MAX_HEIGHT_RATIO
 
         # Check content patterns
@@ -572,7 +574,7 @@ def classify_header_footer_heuristic(
 
         if is_bottom_region and is_small_height:
             new_type = "page-footer"
-            reason = f"bottom region (y+h={y+h:.3f}) + small height (h={h:.3f})"
+            reason = f"bottom region (y2={y2:.3f}) + small height (h={h:.3f})"
             footer_count += 1
         elif is_bottom_region and has_footer_pattern:
             new_type = "page-footer"
@@ -580,7 +582,7 @@ def classify_header_footer_heuristic(
             footer_count += 1
         elif is_top_region and is_small_height:
             new_type = "page-header"
-            reason = f"top region (y={y:.3f}) + small height (h={h:.3f})"
+            reason = f"top region (y1={y1:.3f}) + small height (h={h:.3f})"
             header_count += 1
         elif is_top_region and has_header_pattern:
             new_type = "page-header"
@@ -596,7 +598,7 @@ def classify_header_footer_heuristic(
             if logger:
                 logger.debug(
                     "[HEURISTIC] Block reclassified: %s → %s | bbox=[%.3f, %.3f, %.3f, %.3f] | reason: %s | text: %s",
-                    block_type, new_type, x, y, w, h, reason, text[:50]
+                    block_type, new_type, x1, y1, x2, y2, reason, text[:50]
                 )
             block = {**block, "type": new_type}
 
@@ -1270,13 +1272,13 @@ def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path
         if not (isinstance(bbox, list) and len(bbox) == 4):
             continue
 
-        norm_x, norm_y, norm_w, norm_h = bbox
+        norm_x1, norm_y1, norm_x2, norm_y2 = bbox
 
         # Calculate corners with rounding (not truncation) for accuracy
-        x1 = int(round(norm_x * img_w))
-        y1 = int(round(norm_y * img_h))
-        x2 = int(round((norm_x + norm_w) * img_w))
-        y2 = int(round((norm_y + norm_h) * img_h))
+        x1 = int(round(norm_x1 * img_w))
+        y1 = int(round(norm_y1 * img_h))
+        x2 = int(round(norm_x2 * img_w))
+        y2 = int(round(norm_y2 * img_h))
 
         # Clamp to image bounds to prevent out-of-bounds drawing
         x1 = max(0, min(img_w - 1, x1))
@@ -1414,26 +1416,12 @@ def process_document(
                 classified_blocks = classify_header_footer_heuristic(raw_blocks, logger)
 
                 spec_blocks: List[Dict[str, Any]] = []
-                dropped_header_footer_count = 0
-                dropped_low_confidence_count = 0
 
                 for blk in classified_blocks:
                     block_type = blk.get("type", "paragraph")
                     bbox = blk.get("bbox", [0, 0, 0, 0])
 
-                    # Skip header/footer if flag is enabled
-                    if cfg.drop_header_footer and block_type in ["page-header", "page-footer"]:
-                        dropped_header_footer_count += 1
-                        continue
 
-                    # Skip zero bboxes if flag is enabled
-                    if cfg.skip_low_confidence and bbox == [0.0, 0.0, 0.0, 0.0]:
-                        dropped_low_confidence_count += 1
-                        logger.debug(
-                            "[%s] Skipping low-confidence block (zero bbox): type=%s, text=%s",
-                            page_id, block_type, blk.get("extraction_response", "")[:50]
-                        )
-                        continue
 
                     spec_blocks.append(
                         {
@@ -1445,16 +1433,6 @@ def process_document(
                         }
                     )
 
-                if dropped_header_footer_count > 0:
-                    logger.info(
-                        "[%s] Dropped %d header/footer blocks (--drop-header-footer enabled)",
-                        page_id, dropped_header_footer_count
-                    )
-                if dropped_low_confidence_count > 0:
-                    logger.info(
-                        "[%s] Dropped %d low-confidence blocks (--skip-low-confidence enabled)",
-                        page_id, dropped_low_confidence_count
-                    )
 
                 page_warnings: List[str] = []
                 if attempt_used == "none":
@@ -1674,18 +1652,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Run all inference modes on each page with 3-minute timeout per mode (for debugging slowdowns)",
     )
     parser.add_argument(
-        "--drop-header-footer",
-        action="store_true",
-        default=False,
-        help="Filter out page-header and page-footer blocks from output (requires heuristic classification)",
-    )
-    parser.add_argument(
-        "--skip-low-confidence",
-        action="store_true",
-        default=False,
-        help="Skip blocks with zero bboxes (likely from malformed model output)",
-    )
-    parser.add_argument(
         "--disable-downscale",
         action="store_true",
         default=False,
@@ -1732,8 +1698,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         save_bbox_overlay=not args.no_bbox_overlay,
         disable_fallbacks=not args.enable_fallbacks if not args.disable_fallbacks else args.disable_fallbacks,
         test_all_modes=args.test_all_modes,
-        drop_header_footer=args.drop_header_footer,
-        skip_low_confidence=args.skip_low_confidence,
         disable_downscale=args.disable_downscale,
     )
     ds_cfg = DeepSeekConfig(device=resolved_device, revision=args.revision)
@@ -1881,19 +1845,19 @@ def analyze_bbox_distribution(blocks: List[Dict[str, Any]], logger: Optional[log
         if not (isinstance(bbox, list) and len(bbox) == 4):
             continue
 
-        # bbox is [x, y, width, height] in normalized 0-1 coordinates
-        x, y, w, h = bbox
-        y_coords.append(y)
-        x_coords.append(x)
+        # bbox is [x1, y1, x2, y2] in normalized 0-1 coordinates
+        x1, y1, x2, y2 = bbox
+        y_coords.append(y1)
+        x_coords.append(x1)
 
         # Check edge zones
-        if y < 0.15:
+        if y1 < 0.15:
             top_edge_blocks += 1
-        if y + h > 0.85:
+        if y2 > 0.85:
             bottom_edge_blocks += 1
-        if x < 0.15:
+        if x1 < 0.15:
             left_edge_blocks += 1
-        if x + w > 0.85:
+        if x2 > 0.85:
             right_edge_blocks += 1
 
     if not y_coords:
