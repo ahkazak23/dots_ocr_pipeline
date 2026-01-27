@@ -844,7 +844,7 @@ def _run_inference(
     tokenizer: Any,
     image_path: Path,
     infer_config: Dict[str, Any],
-    timeout_seconds: int = 9999999999999999,  # Increased from 60s to prevent truncated outputs
+    timeout_seconds: int = 9999,  # Increased from 60s to prevent truncated outputs
 ) -> Tuple[str, float]:
     """Run model inference and capture output with timeout.
 
@@ -1122,7 +1122,7 @@ def _run_all_modes_experiment(
         try:
             logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
             t_start = time.time()
-            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=9999999999999999999)
+            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=99999)
             t_end = time.time()
             total_time += infer_time
 
