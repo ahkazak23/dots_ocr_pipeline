@@ -5,7 +5,6 @@ dots.ocr Pipeline - Document OCR with Layout Extraction
 Server-ready implementation (rednote-hilab/dots.ocr). Requires 10GB+ GPU VRAM.
 Features: Prompt fallback, pixel-cap downscaling, unified output schema.
 Install: pip install -e ".[dotsocr]"
-See: README_DOTS_OCR.md for details.
 """
 
 from __future__ import annotations
@@ -40,16 +39,9 @@ except ImportError:
         pass
 
 
-# ----------------------------
-# Constants
-# ----------------------------
-
 MODEL_ID = "rednote-hilab/dots.ocr"
-MAX_PIXEL_AREA = 11_289_600  # Model recommendation: width * height <= 11,289,600
+MAX_PIXEL_AREA = 11_289_600
 
-
-
-# Prompt modes - using official prompt with necessary constraints
 PROMPT_MODES = {
     "layout_all_en": """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
 
@@ -81,7 +73,6 @@ IMPORTANT: The JSON must have the exact top-level format: {"elements":[ ... ]} (
 Return ONLY the JSON object.""",
 }
 
-# Category mapping: dots.ocr categories → unified block types
 CATEGORY_TO_TYPE = {
     "Title": "header",
     "Section-header": "header",
@@ -90,34 +81,37 @@ CATEGORY_TO_TYPE = {
     "Caption": "paragraph",
     "Footnote": "paragraph",
     "Table": "table",
-    "Formula": "paragraph",  # Store as paragraph but preserve category in data
+    "Formula": "paragraph",
     "Picture": "image",
     "Page-header": "page-header",
     "Page-footer": "page-footer",
 }
 
-# Runaway detection patterns
 RUNAWAY_PATTERNS = [
-    re.compile(r"\.{10,}"),  # Excessive dots
-    re.compile(r"_{10,}"),   # Excessive underscores
-    re.compile(r"-{10,}"),   # Excessive dashes
-    re.compile(r"\s{50,}"),  # Excessive whitespace
+    re.compile(r"\.{10,}"),
+    re.compile(r"_{10,}"),
+    re.compile(r"-{10,}"),
+    re.compile(r"\s{50,}"),
 ]
 
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-# ----------------------------
-# Logging
-# ----------------------------
 
 class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for different log levels."""
+
     LEVEL_COLORS = {
-        logging.DEBUG: Fore.CYAN, logging.INFO: Fore.GREEN,
-        logging.WARNING: Fore.YELLOW, logging.ERROR: Fore.RED,
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
         logging.CRITICAL: Fore.RED + Style.BRIGHT,
     }
+
     def format(self, record):
         if COLORS_AVAILABLE:
-            record.levelname = f"{self.LEVEL_COLORS.get(record.levelno, '')}{record.levelname}{Style.RESET_ALL}"
+            level_color = self.LEVEL_COLORS.get(record.levelno, "")
+            record.levelname = f"{level_color}{record.levelname}{Style.RESET_ALL}"
         return super().format(record)
 
 
@@ -125,28 +119,30 @@ def _setup_logger(log_level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger("dots_ocr")
     if logger.handlers:
         return logger
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(level)
     h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(ColoredFormatter("%(asctime)s | %(levelname)s | %(message)s") if COLORS_AVAILABLE
-                   else logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+
+    if COLORS_AVAILABLE:
+        fmt = ColoredFormatter("%(asctime)s | %(levelname)s | %(message)s")
+    else:
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    h.setFormatter(fmt)
     logger.addHandler(h)
     logger.propagate = False
     return logger
 
 
-
-# ----------------------------
-# Config
-# ----------------------------
-
 @dataclass
 class Config:
+    """Configuration for dots.ocr pipeline."""
     model: str = MODEL_ID
     dpi: int = 200
     out_dir: str = "./out_json/dots_ocr"
     eval_out_dir: str = "./evaluation_output"
     prompt_mode: str = "layout_all_en"
-    max_new_tokens: int = 24000  # Official recommendation for layout extraction
+    max_new_tokens: int = 24000
     fallback_enabled: bool = True
     save_rendered_images: bool = False
     save_bbox_overlay: bool = True
@@ -157,15 +153,13 @@ class Config:
 
 @dataclass
 class DotsOcrConfig:
+    """Configuration for dots.ocr model loading."""
     model_path: Optional[str] = None
     device: str = "auto"
     dtype: str = "bfloat16"
     trust_remote_code: bool = True
 
 
-# ----------------------------
-# Backend Interface
-# ----------------------------
 
 @dataclass
 class InferResult:
@@ -179,12 +173,8 @@ class Backend(Protocol):
         ...
 
 
-# ----------------------------
-# TransformersBackend
-# ----------------------------
-
 class TransformersBackend:
-    """HuggingFace Transformers backend for dots.ocr inference (low-level API)."""
+    """HuggingFace Transformers backend for dots.ocr inference."""
 
     def __init__(self, cfg: DotsOcrConfig, logger: logging.Logger):
         self.cfg = cfg
@@ -195,9 +185,8 @@ class TransformersBackend:
 
     @staticmethod
     def _flash_attn2_available() -> bool:
-        """Check if flash_attn package is installed."""
         try:
-            import flash_attn  # noqa: F401
+            import flash_attn
             return True
         except Exception:
             return False
@@ -208,57 +197,46 @@ class TransformersBackend:
 
         model_path = self.cfg.model_path or MODEL_ID
         self.logger.info(f"Loading dots.ocr model from {model_path}...")
-        self.logger.info("Note: First run will download ~4-8GB model files from HuggingFace.")
+        self.logger.info("Note: First run will download ~4-8GB model files from HuggingFace")
 
-        # WORKAROUND: The model name "dots.ocr" has a dot which breaks Python module imports
-        # We need to download and rename locally if loading from HuggingFace
         if model_path == MODEL_ID and not self.cfg.model_path:
-            self.logger.warning("Model name 'dots.ocr' contains a dot which causes import errors.")
-            self.logger.warning("Workaround: Downloading to local directory and renaming...")
-
-            # Download to local directory with underscore name
+            self.logger.warning("Model name 'dots.ocr' contains dot - downloading to local directory")
             from pathlib import Path
 
             local_model_dir = Path.home() / ".cache" / "dots_ocr_renamed"
             local_model_dir.mkdir(parents=True, exist_ok=True)
 
-            # Clone from HuggingFace if not already present
             if not (local_model_dir / "config.json").exists():
                 self.logger.info(f"Downloading model to {local_model_dir}...")
                 try:
                     from huggingface_hub import snapshot_download
 
                     snapshot_download(repo_id=MODEL_ID, local_dir=str(local_model_dir))
-                    self.logger.info("Model downloaded successfully.")
+                    self.logger.info("Model downloaded successfully")
                 except ImportError:
                     self.logger.error("huggingface_hub not installed. Install with: pip install huggingface_hub")
                     raise
             else:
                 self.logger.info(f"Using cached model from {local_model_dir}")
 
-            # Use local path
             model_path = str(local_model_dir)
 
         device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
 
-        # Detect GPU capabilities for optimal settings
         gpu_major, gpu_minor = None, None
         if torch.cuda.is_available():
             gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
 
-        # Dtype selection with hardware-aware fallback (best practice)
-        # Use bfloat16 on Ampere+ GPUs, fall back to float16 when bf16 isn't available
-        # NEVER use "auto" as it can cause mixed precision within the model
         if self.cfg.dtype == "bfloat16":
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 torch_dtype = torch.bfloat16
                 self.logger.info("BF16 supported - using bfloat16 for optimal performance")
             elif torch.cuda.is_available():
                 torch_dtype = torch.float16
-                self.logger.warning("BF16 not supported on this GPU (e.g., T4). Using float16 instead.")
+                self.logger.warning("BF16 not supported on this GPU (e.g., T4). Using float16 instead")
             else:
                 torch_dtype = torch.float32
-                self.logger.warning("CUDA not available. Using float32 on CPU.")
+                self.logger.warning("CUDA not available. Using float32 on CPU")
         elif self.cfg.dtype == "float16":
             torch_dtype = torch.float16
             self.logger.info("Using explicit float16 (user requested)")
@@ -266,8 +244,7 @@ class TransformersBackend:
             torch_dtype = torch.float32
             self.logger.info("Using explicit float32 (user requested)")
         elif self.cfg.dtype == "auto":
-            # Don't allow "auto" - it can cause mixed precision issues
-            self.logger.warning("dtype='auto' not recommended (causes mixed precision). Auto-selecting based on hardware.")
+            self.logger.warning("dtype='auto' not recommended (causes mixed precision). Auto-selecting based on hardware")
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 torch_dtype = torch.bfloat16
                 self.logger.info("BF16 supported - using bfloat16")
@@ -278,36 +255,33 @@ class TransformersBackend:
                 torch_dtype = torch.float32
                 self.logger.info("Using float32 on CPU")
         else:
-            # Fallback for unknown dtype
             torch_dtype = torch.float32
             self.logger.warning(f"Unknown dtype '{self.cfg.dtype}', defaulting to float32")
 
         self.logger.info(f"Using dtype: {torch_dtype}")
 
-        # GPU memory check
         if torch.cuda.is_available():
             gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             self.logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB) - Compute Capability: SM{gpu_major}{gpu_minor}")
 
             if gpu_mem_gb < 8:
                 self.logger.error(
-                    f"CRITICAL: GPU memory is {gpu_mem_gb:.1f} GB. dots.ocr requires ~10GB+ VRAM for inference."
+                    f"CRITICAL: GPU memory is {gpu_mem_gb:.1f} GB. dots.ocr requires ~10GB+ VRAM for inference"
                 )
                 self.logger.error("Inference will fail with OutOfMemoryError. Use --device cpu (very slow but will work)")
 
                 if device_map != "cpu":
                     raise RuntimeError(
                         f"Insufficient GPU memory ({gpu_mem_gb:.1f} GB). "
-                        f"dots.ocr requires ~10GB+ VRAM. Use --device cpu or test in Colab."
+                        f"dots.ocr requires ~10GB+ VRAM. Use --device cpu or test in Colab"
                     )
             elif gpu_mem_gb < 12:
                 self.logger.warning(
-                    f"GPU memory is {gpu_mem_gb:.1f} GB. dots.ocr may encounter OOM errors. Recommended: 12GB+ VRAM."
+                    f"GPU memory is {gpu_mem_gb:.1f} GB. dots.ocr may encounter OOM errors. Recommended: 12GB+ VRAM"
                 )
         else:
             self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
 
-        # Conditional FlashAttention-2 (official recommendation, but only for Ampere+ GPUs with flash_attn installed)
         use_flash_attn = torch.cuda.is_available() and gpu_major >= 8 and self._flash_attn2_available()
 
         if torch.cuda.is_available() and gpu_major >= 8:
@@ -320,7 +294,6 @@ class TransformersBackend:
             self.logger.info(f"Using default attention (SM{gpu_major}{gpu_minor} < SM80, FlashAttention-2 not supported)")
 
         try:
-            # Load from local directory (no split loading needed since we renamed the repo)
             self.logger.info(f"Loading processor from {model_path}...")
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
@@ -329,11 +302,10 @@ class TransformersBackend:
                 local_files_only=True if self.cfg.model_path else False,
             )
 
-            # Load model
             model_kwargs = {
                 "trust_remote_code": self.cfg.trust_remote_code,
                 "device_map": device_map,
-                "torch_dtype": torch_dtype,  # Always explicit dtype, never "auto"
+                "torch_dtype": torch_dtype,
                 "local_files_only": True if self.cfg.model_path else False,
             }
             if use_flash_attn:
@@ -348,10 +320,10 @@ class TransformersBackend:
         except Exception as exc:
             if "ModuleNotFoundError" in str(type(exc).__name__) and "dots" in str(exc):
                 self.logger.error("=" * 80)
-                self.logger.error("MODEL LOADING FAILED: The model name 'dots.ocr' contains a dot.")
-                self.logger.error("Python treats the dot as a module separator, causing import errors.")
+                self.logger.error("MODEL LOADING FAILED: The model name 'dots.ocr' contains a dot")
+                self.logger.error("Python treats the dot as a module separator, causing import errors")
                 self.logger.error("")
-                self.logger.error("SOLUTION: Model should be auto-downloaded and renamed.")
+                self.logger.error("SOLUTION: Model should be auto-downloaded and renamed")
                 self.logger.error("If this persists, manually:")
                 self.logger.error("  1. Download: huggingface-cli download rednote-hilab/dots.ocr")
                 self.logger.error("  2. Rename folder: dots.ocr -> dots_ocr")
@@ -359,22 +331,16 @@ class TransformersBackend:
                 self.logger.error("=" * 80)
             raise
 
-        self.logger.info("Model loaded successfully.")
+        self.logger.info("Model loaded successfully")
 
-        # CRITICAL: Force entire model to uniform dtype to prevent mixed precision issues
-        # device_map="auto" can cause some layers to be fp16 and others bf16, leading to:
-        # "RuntimeError: Input type (c10::BFloat16) and bias type (c10::Half) should be the same"
         if torch_dtype not in ["auto", None]:
-            # Check for mixed precision in model
             param_dtypes = {p.dtype for p in self._model.parameters()}
             if len(param_dtypes) > 1:
                 self.logger.warning(f"Model has mixed precision parameters: {param_dtypes}")
                 self.logger.warning(f"Converting entire model to uniform dtype: {torch_dtype}")
 
-            # Force all parameters to the target dtype
             self._model = self._model.to(dtype=torch_dtype)
 
-            # Verify conversion
             final_dtypes = {p.dtype for p in self._model.parameters()}
             if len(final_dtypes) == 1:
                 self.logger.info(f"Model unified to dtype: {next(iter(final_dtypes))}")
@@ -382,13 +348,7 @@ class TransformersBackend:
                 self.logger.error(f"Warning: Model still has mixed dtypes after conversion: {final_dtypes}")
 
     def _cast_floating_inputs_to_model_dtype(self, inputs):
-        """Cast floating-point tensors in inputs to match model's dtype.
-
-        Prevents dtype mismatch errors like:
-        'Input type (c10::BFloat16) and bias type (c10::Half) should be the same'
-
-        This ensures ALL floating tensors match the model's dtype before inference.
-        """
+        """Cast floating-point tensors in inputs to match model's dtype."""
         import torch
         model_dtype = next(self._model.parameters()).dtype
 
@@ -421,12 +381,10 @@ class TransformersBackend:
             padding=True, return_tensors="pt",
         ).to(self._model.device)
 
-        # Cast floating inputs to model's dtype
         inputs = self._cast_floating_inputs_to_model_dtype(inputs)
 
         with torch.inference_mode():
             try:
-                # Deterministic generation to prevent format drift
                 generated_ids = self._model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
@@ -447,20 +405,17 @@ class TransformersBackend:
         input_len = inputs.input_ids.shape[1]
         generated_ids_trimmed = [out_ids[input_len:] for out_ids in generated_ids]
 
-        # Robust decoding: some processors put batch_decode on tokenizer
         decoder = getattr(self._processor, "tokenizer", self._processor)
         output_text = decoder.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
-        # Strip model special tokens that may break JSON parsing
         output_text = output_text.replace("<|endofassistant|>", "").strip()
-        output_text = output_text.replace("<|im_end|>", "").strip()  # Common Qwen token
+        output_text = output_text.replace("<|im_end|>", "").strip()
 
         output_tokens = len(generated_ids_trimmed[0])
         infer_time = time.time() - t0
 
-        # Check for runaway patterns
         for pattern in RUNAWAY_PATTERNS:
             if pattern.search(output_text):
                 warnings_list.append(f"runaway_pattern_detected: {pattern.pattern}")
@@ -476,12 +431,8 @@ class TransformersBackend:
         )
 
 
-# ----------------------------
-# PipelineBackend
-# ----------------------------
-
 class PipelineBackend:
-    """HuggingFace Transformers pipeline backend for dots.ocr (high-level API)."""
+    """HuggingFace Transformers pipeline backend for dots.ocr."""
 
     def __init__(self, cfg: DotsOcrConfig, logger: logging.Logger):
         self.cfg = cfg
@@ -495,9 +446,8 @@ class PipelineBackend:
 
         model_path = self.cfg.model_path or MODEL_ID
         self.logger.info(f"Loading dots.ocr pipeline from {model_path}...")
-        self.logger.info("Note: Pipeline API is simpler but has less control over model loading.")
+        self.logger.info("Note: Pipeline API is simpler but has less control over model loading")
 
-        # GPU detection for dtype
         gpu_major, gpu_minor = None, None
         torch_dtype = self.cfg.dtype
         if torch.cuda.is_available():
@@ -505,20 +455,17 @@ class PipelineBackend:
             gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             self.logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB) - Compute Capability: SM{gpu_major}{gpu_minor}")
 
-            # T4 bf16 detection
             if torch_dtype == "bfloat16" and gpu_major < 8:
-                self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16.")
+                self.logger.warning("GPU likely lacks bf16 support (e.g., T4). Switching dtype to float16")
                 torch_dtype = "float16"
         else:
             self.logger.warning("CUDA not available; using CPU (inference will be very slow)")
 
-        # Pipeline kwargs
         pipe_kwargs = {
             "model": model_path,
             "trust_remote_code": self.cfg.trust_remote_code,
             "torch_dtype": torch_dtype,
         }
-
 
         device_map = "auto" if self.cfg.device == "auto" else self.cfg.device
         if device_map != "auto":
@@ -526,7 +473,7 @@ class PipelineBackend:
 
         try:
             self._pipe = pipeline("image-text-to-text", **pipe_kwargs)
-            self.logger.info("Pipeline loaded successfully.")
+            self.logger.info("Pipeline loaded successfully")
         except Exception as exc:
             self.logger.error(f"Pipeline loading failed: {type(exc).__name__}: {exc}")
             if "trust_remote_code" in str(exc):
@@ -539,11 +486,8 @@ class PipelineBackend:
         t0 = time.time()
         warnings_list = []
 
-        # Build messages for pipeline
         prompt_text = PROMPT_MODES.get(prompt_mode, PROMPT_MODES["layout_all_en"])
 
-        # Convert PIL Image to format expected by pipeline
-        # Pipeline expects either path or PIL image directly
         messages = [
             {
                 "role": "user",
@@ -555,10 +499,8 @@ class PipelineBackend:
         ]
 
         try:
-            # Pipeline inference
             result = self._pipe(text=messages, max_new_tokens=max_new_tokens)
 
-            # Extract text from pipeline result
             if isinstance(result, list) and len(result) > 0:
                 output_text = result[0].get("generated_text", "")
             elif isinstance(result, dict):
@@ -568,13 +510,11 @@ class PipelineBackend:
 
             infer_time = time.time() - t0
 
-            # Check for runaway patterns
             for pattern in RUNAWAY_PATTERNS:
                 if pattern.search(output_text):
                     warnings_list.append(f"runaway_pattern_detected: {pattern.pattern}")
                     self.logger.warning(f"Runaway pattern detected: {pattern.pattern}")
 
-            # Parse JSON
             parsed_json, parse_warnings = parse_model_output(output_text, self.logger)
             warnings_list.extend(parse_warnings)
 
@@ -584,7 +524,7 @@ class PipelineBackend:
                 diagnostics={
                     "prompt_mode": prompt_mode,
                     "time_sec": round(infer_time, 4),
-                    "output_tokens": len(output_text.split()),  # Approximate
+                    "output_tokens": len(output_text.split()),
                     "warnings": warnings_list
                 }
             )
@@ -603,29 +543,22 @@ class PipelineBackend:
             )
 
 
-# ----------------------------
-# JSON Parsing & Fallback Chain
-# ----------------------------
-
 def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    """Parse dots.ocr output into a dict. Accepts dict or list; wraps list into {'elements': list}."""
+    """Parse dots.ocr output into a dict."""
     warnings = []
     if not raw_text or not raw_text.strip():
         return None, ["empty_output"]
 
     text = raw_text.strip()
 
-    # Remove known special tokens that break JSON
     text = text.replace("<|endofassistant|>", "").strip()
 
-    # Try direct JSON load first (supports dict OR list)
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list):
             warnings.append("wrapped_list_into_elements")
             parsed = {"elements": parsed}
 
-        # Validate schema after wrapping
         if isinstance(parsed, dict):
             validation_result = _validate_dots_schema(parsed, logger)
             if validation_result:
@@ -637,7 +570,6 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
     except Exception:
         pass
 
-    # Balanced extraction: find first balanced {...} or [...] inside mixed output
     extracted = _extract_first_balanced_json(text)
     if extracted is not None:
         try:
@@ -647,7 +579,6 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
                 warnings.append("wrapped_list_into_elements")
                 parsed = {"elements": parsed}
 
-            # Validate schema after wrapping
             if isinstance(parsed, dict):
                 validation_result = _validate_dots_schema(parsed, logger)
                 if validation_result:
@@ -664,10 +595,9 @@ def parse_model_output(raw_text: str, logger: Optional[logging.Logger] = None) -
 
 
 def _validate_dots_schema(parsed: Dict[str, Any], logger: Optional[logging.Logger] = None) -> List[str]:
-    """Validate dots.ocr JSON schema. Returns list of validation warnings."""
+    """Validate dots.ocr JSON schema."""
     warnings = []
 
-    # Must have elements list
     if "elements" not in parsed:
         warnings.append("schema_error:missing_elements_key")
         return warnings
@@ -677,19 +607,16 @@ def _validate_dots_schema(parsed: Dict[str, Any], logger: Optional[logging.Logge
         warnings.append("schema_error:elements_not_list")
         return warnings
 
-    # Allowed categories
     allowed_categories = {
         'Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer',
         'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'
     }
 
-    # Validate each element
     for idx, elem in enumerate(elements):
         if not isinstance(elem, dict):
             warnings.append(f"schema_error:element_{idx}_not_dict")
             continue
 
-        # Check required fields
         if "bbox" not in elem:
             warnings.append(f"schema_error:element_{idx}_missing_bbox")
         elif not isinstance(elem["bbox"], list) or len(elem["bbox"]) != 4:
@@ -700,7 +627,6 @@ def _validate_dots_schema(parsed: Dict[str, Any], logger: Optional[logging.Logge
         elif elem["category"] not in allowed_categories:
             warnings.append(f"schema_warning:element_{idx}_unknown_category_{elem['category']}")
 
-        # Check text field requirement
         category = elem.get("category", "")
         if category != "Picture" and "text" not in elem:
             warnings.append(f"schema_warning:element_{idx}_missing_text_for_{category}")
@@ -712,7 +638,6 @@ def _validate_dots_schema(parsed: Dict[str, Any], logger: Optional[logging.Logge
 
 def _extract_first_balanced_json(s: str) -> Optional[str]:
     """Extract first balanced {...} or [...] from string."""
-    # Find first '{' or '['
     starts = [(s.find("{"), "{"), (s.find("["), "[")]
     starts = [(i, ch) for (i, ch) in starts if i != -1]
     if not starts:
@@ -754,10 +679,7 @@ def _extract_first_balanced_json(s: str) -> Optional[str]:
 def run_page_ocr_with_fallback(
     backend: Backend, image: Image.Image, cfg: Config, logger: logging.Logger, page_id: str = ""
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """Run OCR with prompt fallback chain: layout_all_en → layout_only_en.
-
-    Note: 'ocr' mode removed from chain as it returns plain text/HTML, not JSON.
-    """
+    """Run OCR with prompt fallback chain: layout_all_en → layout_only_en."""
     fallback_chain = ["layout_all_en", "layout_only_en"] if cfg.fallback_enabled else [cfg.prompt_mode]
     all_diagnostics, total_time = [], 0.0
 
@@ -780,14 +702,21 @@ def run_page_ocr_with_fallback(
     return None, {"attempts": all_diagnostics, "successful_prompt_mode": None, "total_time_sec": round(total_time, 4)}
 
 
-# ----------------------------
-# PDF Rendering with Pixel Cap
-# ----------------------------
-
 def render_pdf_to_images(
     pdf_path: Path, dpi: int, tmp_dir: Path, logger: logging.Logger, page_indices: Optional[List[int]] = None
 ) -> List[Tuple[Path, Dict[str, Any]]]:
-    """Render PDF pages to images with pixel-cap downscaling (11.3MP max)."""
+    """Render PDF pages to images with pixel-cap downscaling.
+
+    Args:
+        pdf_path: Input PDF path.
+        dpi: Render DPI.
+        tmp_dir: Output directory for rendered page images.
+        logger: Logger instance.
+        page_indices: Optional list of 0-based page indices to render.
+
+    Returns:
+        List of tuples (image_path, render_metadata).
+    """
     doc = fitz.open(pdf_path)
     results, mat = [], fitz.Matrix(dpi / 72.0, dpi / 72.0)
     total_pages = len(doc)
@@ -831,18 +760,11 @@ def render_pdf_to_images(
     return results
 
 
-# ----------------------------
-# Normalization
-# ----------------------------
-
 def _parse_html_table_to_structure(html_text: str, logger: Optional[logging.Logger] = None) -> Optional[Dict[str, Any]]:
     """Parse HTML table into structured format with headers and rows.
 
     Returns:
-        {
-            "headers": [["col1", "col2", ...]],  # Can be multi-row headers
-            "rows": [[cell1, cell2, ...], ...]
-        }
+        Dict with "headers" and "rows" keys, or None if parsing fails.
     """
     try:
         from html.parser import HTMLParser
@@ -925,7 +847,7 @@ def normalize_dots_output(
     page_index: int, dots_json: Dict[str, Any], img_size: Tuple[int, int],
     logger: logging.Logger
 ) -> Dict[str, Any]:
-    """Normalize dots.ocr JSON to unified block schema with normalized bboxes (0-1 range)."""
+    """Normalize dots.ocr JSON to unified block schema with normalized bboxes [x1, y1, x2, y2] in 0-1 range."""
     img_w, img_h = img_size
     elements = dots_json.get("elements", [])
 
@@ -941,51 +863,40 @@ def normalize_dots_output(
         category = elem.get("category", "Text")
         block_type = CATEGORY_TO_TYPE.get(category, "paragraph")
 
-
-        # Get bbox and convert to normalized coordinates [x, y, width, height] in 0-1 range
         bbox_raw = elem.get("bbox", [0, 0, 0, 0])
         if not (isinstance(bbox_raw, list) and len(bbox_raw) == 4):
             bbox_raw = [0, 0, 0, 0]
 
         x1, y1, x2, y2 = bbox_raw
 
-        # Clamp to image bounds
         px1 = max(0.0, min(float(x1), float(img_w)))
         py1 = max(0.0, min(float(y1), float(img_h)))
         px2 = max(0.0, min(float(x2), float(img_w)))
         py2 = max(0.0, min(float(y2), float(img_h)))
 
-        # Normalize to 0-1 range: [x, y, width, height]
-        norm_x = px1 / img_w if img_w > 0 else 0.0
-        norm_y = py1 / img_h if img_h > 0 else 0.0
-        norm_w = (px2 - px1) / img_w if img_w > 0 else 0.0
-        norm_h = (py2 - py1) / img_h if img_h > 0 else 0.0
+        norm_x1 = px1 / img_w if img_w > 0 else 0.0
+        norm_y1 = py1 / img_h if img_h > 0 else 0.0
+        norm_x2 = px2 / img_w if img_w > 0 else 0.0
+        norm_y2 = py2 / img_h if img_h > 0 else 0.0
 
         bbox = [
-            max(0.0, min(1.0, norm_x)),
-            max(0.0, min(1.0, norm_y)),
-            max(0.0, min(1.0, norm_w)),
-            max(0.0, min(1.0, norm_h)),
+            max(0.0, min(1.0, norm_x1)),
+            max(0.0, min(1.0, norm_y1)),
+            max(0.0, min(1.0, norm_x2)),
+            max(0.0, min(1.0, norm_y2)),
         ]
 
         text = elem.get("text", "") if block_type != "image" else ""
 
-        # Build extraction_response_parsed matching deepseek format
-        # extraction_response = raw model output (HTML for tables, text for others)
-        # extraction_response_parsed.data = structured data (for tables: parsed headers + rows)
-        # extraction_response_parsed.text = text content
-
         if block_type == "table" and text:
-            # Parse HTML table to structured data
             table_data = _parse_html_table_to_structure(text, logger)
             parsed_payload = {
-                "data": table_data,  # Structured: {"headers": [...], "rows": [...]}
-                "text": text  # Keep HTML for fallback/display
+                "data": table_data,
+                "text": text
             }
         elif block_type == "image":
             parsed_payload = {"data": None, "text": ""}
         else:
-            # For text blocks, no structure needed - just text
             parsed_payload = {"data": None, "text": text}
 
         blocks.append({
@@ -1001,15 +912,11 @@ def normalize_dots_output(
     return {"ocr": {"blocks": blocks}}
 
 
-# ----------------------------
-# Input Processing
-# ----------------------------
-
 def is_pdf(path: Path) -> bool:
     return path.suffix.lower() == ".pdf"
 
 def is_image(path: Path) -> bool:
-    return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    return path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS
 
 def gather_inputs(input_arg: Path) -> List[Path]:
     if input_arg.is_file():
@@ -1036,14 +943,13 @@ def save_bbox_image(page_img: Image.Image, blocks: List[Dict[str, Any]], dest_pa
         if not (isinstance(bbox, list) and len(bbox) == 4):
             continue
 
-        # Convert from normalized [x, y, w, h] to pixel coordinates
-        norm_x, norm_y, norm_w, norm_h = bbox
-        x = int(norm_x * img_w)
-        y = int(norm_y * img_h)
-        w = int(norm_w * img_w)
-        h = int(norm_h * img_h)
+        norm_x1, norm_y1, norm_x2, norm_y2 = bbox
+        x1 = int(norm_x1 * img_w)
+        y1 = int(norm_y1 * img_h)
+        x2 = int(norm_x2 * img_w)
+        y2 = int(norm_y2 * img_h)
 
-        draw.rectangle([x, y, x + w, y + h], outline="red", width=2)
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(dest_path)
@@ -1056,7 +962,7 @@ def build_spec_page_payload(
     blocks: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build a per-page spec payload matching deepseek_ocr format."""
+    """Build a per-page spec payload."""
     payload = {
         "document_id": document_id,
         "page_id": page_id,
@@ -1081,11 +987,21 @@ def process_document(
     page_range: Optional[str] = None,
     legacy_document_json: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Process a single document (PDF or image).
+    """Process a single document (PDF or image).
+
+    Args:
+        backend: OCR backend instance.
+        input_path: Input file path.
+        cfg: Configuration.
+        output_root: Output directory root.
+        selection_label: Label for page selection.
+        logger: Logger instance.
+        pages: Optional list of 1-based page indices.
+        page_range: Optional page range string.
+        legacy_document_json: Whether to write legacy document.json.
 
     Returns:
-        (doc_json, summary_metrics)
+        Tuple of (doc_json, summary_metrics).
     """
     warnings_list: List[str] = []
     input_type = "pdf" if is_pdf(input_path) else "image"
@@ -1098,19 +1014,16 @@ def process_document(
         tmp_path = Path(tmpdir)
 
         if input_type == "pdf":
-            # Get page count and parse selection
             doc_temp = fitz.open(input_path)
             total_pages = len(doc_temp)
             doc_temp.close()
 
             selected_indices = parse_page_selection(pages, page_range, total_pages)
 
-            # Render selected pages
             page_image_paths = render_pdf_to_images(
                 input_path, cfg.dpi, tmp_path, logger, page_indices=selected_indices
             )
         else:
-            # Single image
             img = Image.open(input_path).convert("RGB")
             img_path = tmp_path / "page_0.png"
             img.save(img_path)
@@ -1137,7 +1050,6 @@ def process_document(
 
             page_id = f"{input_path.stem}|P{page_index+1:03d}"
 
-            # Persist rendered image if requested
             if cfg.save_rendered_images:
                 try:
                     _copy_image(img_path, page_dir / "render.png")
@@ -1145,17 +1057,14 @@ def process_document(
                     logger.warning(f"[{page_id}] Failed to save render.png: {exc}")
 
             try:
-                # Load image
                 page_img = Image.open(img_path).convert("RGB")
                 img_size = page_img.size
                 resolution = [img_size[0], img_size[1]]
 
-                # Run OCR with fallback
                 dots_json, ocr_diagnostics = run_page_ocr_with_fallback(
                     backend, page_img, cfg, logger, page_id
                 )
 
-                # Normalize to unified schema
                 if dots_json:
                     page_ocr = normalize_dots_output(
                         page_index, dots_json, img_size, logger
@@ -1164,23 +1073,19 @@ def process_document(
                     page_ocr = {"ocr": {"blocks": []}}
                     warnings_list.append(f"Page {page_index}: OCR failed after all fallbacks")
 
-                # Extract metrics
                 page_time = ocr_diagnostics.get("total_time_sec", 0.0)
                 total_time += page_time
 
-                # Get output tokens from last attempt
                 attempts = ocr_diagnostics.get("attempts", [])
                 page_output_tokens = attempts[-1].get("output_tokens", 0) if attempts else 0
                 total_output_tokens += page_output_tokens
 
-                # Save bbox overlay if enabled
                 if cfg.save_bbox_overlay:
                     try:
                         save_bbox_image(page_img, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
                     except Exception as exc:
                         logger.warning(f"[{page_id}] failed to save bbox overlay: {type(exc).__name__}: {exc}")
 
-                # Build spec-compliant blocks
                 spec_blocks: List[Dict[str, Any]] = []
                 for blk in page_ocr.get("ocr", {}).get("blocks", []):
                     spec_blocks.append({
@@ -1191,7 +1096,6 @@ def process_document(
                         "extraction_response_parsed": blk["extraction_response_parsed"],
                     })
 
-                # Collect page warnings
                 page_warnings: List[str] = []
                 attempts_data = ocr_diagnostics.get("attempts", [])
                 if not attempts_data:
@@ -1202,7 +1106,6 @@ def process_document(
                 if len(spec_blocks) == 0 and attempts_data:
                     page_warnings.append("No blocks extracted from page")
 
-                # Write spec-compliant page JSON
                 document_id = input_path.stem
                 page_id_str = str(page_index)
                 spec_payload = build_spec_page_payload(
@@ -1216,7 +1119,6 @@ def process_document(
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 logger.debug(f"[{page_id}] wrote {page_json_path.name}")
 
-                # Build legacy payload for document.json
                 page_payload = {
                     "meta": {
                         "model": cfg.model,
@@ -1237,7 +1139,6 @@ def process_document(
 
                 pages_out.append(page_payload)
 
-                # Track timing info
                 page_timings.append({
                     "page_index": page_index,
                     "page_label": page_index + 1,
@@ -1252,7 +1153,6 @@ def process_document(
                 warnings_list.append(error_msg)
                 logger.error(f"[{page_id}] PAGE FAILED: {exc}")
 
-                # Write error spec page
                 try:
                     img = Image.open(img_path).convert("RGB")
                     resolution = [img.size[0], img.size[1]]
@@ -1272,7 +1172,6 @@ def process_document(
                 page_json_path = selection_dir / f"page_{page_index + 1}.json"
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-                # Legacy payload
                 page_payload = {
                     "meta": {
                         "model": cfg.model,
@@ -1331,9 +1230,6 @@ def process_document(
     return doc_json, summary
 
 
-# ----------------------------
-# CLI and Main
-# ----------------------------
 
 def parse_page_selection(
     pages: Optional[List[int]],
@@ -1386,7 +1282,6 @@ def write_run_summary(
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description="dots.ocr pipeline for document OCR with layout extraction"
     )
@@ -1462,11 +1357,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Main entry point."""
     args = parse_args(argv)
     logger = _setup_logger(args.log_level)
 
-    # Build config
     cfg = Config(
         dpi=args.dpi,
         out_dir=args.output_dir,
@@ -1487,7 +1380,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         dtype=args.dtype,
     )
 
-    # Gather inputs
     input_path = Path(args.input).expanduser().resolve()
     try:
         inputs = gather_inputs(input_path)
@@ -1496,10 +1388,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if not inputs:
-        logger.error("No valid PDF or image files found.")
+        logger.error("No valid PDF or image files found")
         return 2
 
-    # Build backend
     backend = TransformersBackend(backend_cfg, logger)
     logger.info("Backend loaded. Starting OCR...")
 
@@ -1508,19 +1399,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         logger.info("Legacy document.json output: disabled")
 
-    # Setup output directories
     out_dir = Path(cfg.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_dir = Path(cfg.eval_out_dir).expanduser().resolve()
 
-    # Process documents
     run_items: List[Dict[str, Any]] = []
     grand_total_time = 0.0
     total_pages = 0
 
     run_start = time.time()
     for inp in inputs:
-        # Determine selection label
         selection_label = "all_pages"
         if args.pages:
             selection_label = "pages_" + "-".join(map(str, args.pages))
@@ -1544,7 +1432,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             legacy_document_json=args.legacy_document_json,
         )
 
-        # Determine output path for run summary
         selection_dir = doc_root / selection_label
         out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
 
@@ -1562,7 +1449,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_total_time = time.time() - run_start
 
-    # Write run summary
     summary_path = write_run_summary(
         eval_dir=eval_dir,
         run_items=run_items,
@@ -1582,4 +1468,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
     sys.exit(main())
-
