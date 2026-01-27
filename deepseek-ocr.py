@@ -80,7 +80,7 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 2000  # HuggingFace: 2000, Ollama: 1280 works better
+MAX_IMAGE_DIMENSION = 9999  # HuggingFace: 2000, Ollama: 1280 works better
 
 DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
 
