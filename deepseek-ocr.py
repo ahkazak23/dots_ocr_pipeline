@@ -67,32 +67,31 @@ REF_RE = re.compile(
 )
 
 LABEL_TO_TYPE = {
-    "text": "text_block",
-    "title": "title",
+    "text": "paragraph",
+    "title": "paragraph",
     "table": "table",
-    "table_caption": "table",
     "image": "image",
     "diagram": "diagram",
-    "header": "page_header",
-    "footer": "page_footer",
-    "page-header": "page_header",
-    "page-footer": "page_footer",
+    "header": "page-header",
+    "footer": "page-footer",
+    "page-header": "page-header",
+    "page-footer": "page-footer",
 }
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 2000  # HuggingFace: 2000, Ollama: 1280 works better
+MAX_IMAGE_DIMENSION = 9999  # HuggingFace: 2000, Ollama: 1280 works better
 
-DEFAULT_PROMPT_EXTRACT_ALL = "image>\n<|grounding|>Convert the document to markdown. "
+DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
 # Mode-specific inference configurations
 INFERENCE_MODES = {
     "extract_all": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown. ",
+        "prompt": "<image>\n<|grounding|>Free OCR.",
         "base_size": 1024,
-        "image_size": 768,
+        "image_size": 640,
         "crop_mode": True,  # Enable crop mode for edge detection
     },
     "document": {
@@ -232,12 +231,12 @@ class Backend(str, enum.Enum):
 @dataclass
 class Config:
     """Configuration for DeepSeek-OCR pipeline."""
-    model: str = "deepseek-ai/DeepSeek-OCR-2"
+    model: str = "deepseek-ai/DeepSeek-OCR"
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
     eval_out_dir: str = "./evaluation_output"
-    log_level: str = "DEBUG"
+    log_level: str = "INFO"
     debug_keep_renders: bool = True
     save_bbox_overlay: bool = True
     disable_fallbacks: bool = False
@@ -693,66 +692,6 @@ def try_parse_markdown_table(md: str) -> Optional[Dict[str, Any]]:
     return {"columns": columns, "rows": rows}
 
 
-def try_parse_html_table(html: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse HTML table into structured data.
-    Returns {"headers": [...], "rows": [[...], ...]} or None if parsing fails.
-    """
-    if not html or "<table>" not in html.lower():
-        return None
-
-    # Simple regex-based HTML table parsing
-    # Extract all <tr> tags
-    tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.IGNORECASE | re.DOTALL)
-    tr_matches = tr_pattern.findall(html)
-
-    if not tr_matches:
-        return None
-
-    headers = []
-    rows = []
-
-    for i, tr_content in enumerate(tr_matches):
-        # Check if this is a header row (contains <th> tags)
-        th_pattern = re.compile(r'<th[^>]*>(.*?)</th>', re.IGNORECASE | re.DOTALL)
-        td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.IGNORECASE | re.DOTALL)
-
-        th_matches = th_pattern.findall(tr_content)
-        td_matches = td_pattern.findall(tr_content)
-
-        if th_matches and i == 0:
-            # First row with <th> tags is the header
-            headers = [_clean_html(cell) for cell in th_matches]
-        elif td_matches:
-            # Data row
-            row = [_clean_html(cell) for cell in td_matches]
-            rows.append(row)
-        elif th_matches and not headers:
-            # Fallback: treat <th> as headers even if not first row
-            headers = [_clean_html(cell) for cell in th_matches]
-
-    # If we found headers and rows, return structured data
-    if headers or rows:
-        return {"headers": headers, "rows": rows}
-
-    return None
-
-
-def _clean_html(text: str) -> str:
-    """Remove HTML tags and clean up text."""
-    # Remove HTML tags
-    text = re.sub(r'<[^>]+>', '', text)
-    # Decode HTML entities
-    text = text.replace('&nbsp;', ' ')
-    text = text.replace('&lt;', '<')
-    text = text.replace('&gt;', '>')
-    text = text.replace('&amp;', '&')
-    text = text.replace('&quot;', '"')
-    # Clean up whitespace
-    text = ' '.join(text.split())
-    return text.strip()
-
-
 def build_spec_page_payload(
     document_id: str,
     page_id: str,
@@ -760,23 +699,16 @@ def build_spec_page_payload(
     blocks: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build a per-page spec payload matching OmniDocBench format."""
-    # Convert page_id to integer
-    try:
-        page_id_int = int(page_id)
-    except (ValueError, TypeError):
-        page_id_int = 0
-
+    """Build a per-page spec payload."""
     payload = {
-        "meta": {
-            "document_id": document_id,
-            "page_id": page_id_int,
-            "page_resolution": resolution,
-            "warnings": warnings if warnings else [],
-        },
+        "document_id": document_id,
+        "page_id": page_id,
+        "resolution": resolution,
         "ocr": {"blocks": blocks},
     }
 
+    if warnings:
+        payload["warnings"] = warnings
 
     return payload
 
@@ -785,15 +717,8 @@ def parse_grounded_stdout(
     captured: str,
     image_path: Path,
     logger: logging.Logger,
-    page_id: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
-
-    Args:
-        captured: Raw model output text
-        image_path: Path to the image file
-        logger: Logger instance
-        page_id: Page identifier for logging context
 
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
@@ -801,9 +726,6 @@ def parse_grounded_stdout(
     img = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     resolution = [img_w, img_h]
-
-    logger.debug("[%s] Parsing grounded output: image=%s (%dx%d), captured_len=%d",
-                 page_id or "UNKNOWN", image_path.name, img_w, img_h, len(captured))
 
     matches = list(REF_RE.finditer(captured))
     blocks: List[Dict[str, Any]] = []
@@ -876,30 +798,24 @@ def parse_grounded_stdout(
                 det_text[:100],
             )
 
-        block_type = LABEL_TO_TYPE.get(label, "text_block")
+        block_type = LABEL_TO_TYPE.get(label, "paragraph")
 
         if block_type == "table":
-            # Try parsing HTML table first, then fall back to Markdown
-            table_data = try_parse_html_table(content)
-            if table_data is None:
-                table_data = try_parse_markdown_table(content)
+            table_data = try_parse_markdown_table(content)
             parsed_payload = {"data": table_data, "text": normalize_text(content)}
         elif block_type == "image":
             parsed_payload = {"data": None, "text": ""}
         else:
             parsed_payload = {"data": None, "text": normalize_text(content)}
 
-        # Build block matching OmniDocBench format
-        # Keep id/order for backward compatibility with bbox overlay tools
+        # BBox overlay expects legacy blocks with id/order.
         legacy_block = {
+            "id": f"blk_{len(blocks) + 1}",
             "type": block_type,
+            "order": len(blocks),
             "bbox": bbox,
-            "extraction_origin": "deepseek-ocr",
             "extraction_response": content,
             "extraction_response_parsed": parsed_payload,
-            # Legacy fields for bbox overlay compatibility
-            "id": f"blk_{len(blocks) + 1}",
-            "order": len(blocks),
         }
         blocks.append(legacy_block)
 
@@ -928,18 +844,9 @@ def _run_inference(
     tokenizer: Any,
     image_path: Path,
     infer_config: Dict[str, Any],
-    timeout_seconds: int = 180,  # Increased from 60s to prevent truncated outputs
-    debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
+    timeout_seconds: int = 9999,  # Increased from 60s to prevent truncated outputs
 ) -> Tuple[str, float]:
     """Run model inference and capture output with timeout.
-
-    Args:
-        model: The model instance
-        tokenizer: The tokenizer instance
-        image_path: Path to input image
-        infer_config: Inference configuration dictionary
-        timeout_seconds: Maximum time to wait for inference
-        debug_save_path: If provided, save raw model output to this file
 
     Returns:
         (captured_text, inference_time_sec)
@@ -947,7 +854,6 @@ def _run_inference(
     logger = logging.getLogger("deepseek_ocr")
 
     t0 = time.time()
-    # Create fresh StringIO buffers for this inference
     out_buf = StringIO()
     err_buf = StringIO()
 
@@ -976,28 +882,20 @@ def _run_inference(
     exception_msg = None
     timeout_occurred = False
 
-    # Force cleanup of any lingering output
-    import sys
-    sys.stdout.flush()
-    sys.stderr.flush()
-
     def _inference_worker():
         """Worker function to run inference in a thread."""
         nonlocal res, exception_msg
         try:
-            # Create isolated temp directory for this inference to prevent cross-page pollution
-            with tempfile.TemporaryDirectory() as inference_tmpdir:
-                with torch.inference_mode():
-                    # Capture stdout/stderr to prevent debug output pollution
-                    with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                        res = model.infer(
-                            tokenizer,
-                            prompt=prompt,
-                            image_file=str(image_path),
-                            output_path=inference_tmpdir,  # Unique directory per inference
-                            save_results=False,
-                            **config_for_infer,
-                        )
+            with torch.inference_mode():
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    res = model.infer(
+                        tokenizer,
+                        prompt=prompt,
+                        image_file=str(image_path),
+                        output_path=str(image_path.parent),
+                        save_results=False,
+                        **config_for_infer,
+                    )
         except Exception as exc:
             exception_msg = f"{type(exc).__name__}: {exc}"
             logger.error("Inference exception in worker: %s", exception_msg)
@@ -1038,52 +936,6 @@ def _run_inference(
     if exception_msg:
         if not captured:
             captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
-
-    # Clean up model debug output that pollutes the response
-    # The model outputs lines like "=====================\nBASE:  torch.Size([1, 256, 1280])\nPATCHES:  torch.Size([6, 100, 1280])\n====================="
-    if captured:
-        lines = captured.split('\n')
-        cleaned_lines = []
-        skip_next = False
-
-        for i, line in enumerate(lines):
-            # Skip debug separator lines
-            if line.strip() == "=====================":
-                # Check if this is part of debug output (surrounded by BASE/PATCHES)
-                if i + 1 < len(lines) and ("BASE:" in lines[i + 1] or "PATCHES:" in lines[i + 1]):
-                    skip_next = True
-                    continue
-                if i > 0 and ("BASE:" in lines[i - 1] or "PATCHES:" in lines[i - 1]):
-                    continue
-
-            # Skip BASE/PATCHES debug lines
-            if "BASE:" in line and "torch.Size" in line:
-                continue
-            if "PATCHES:" in line and "torch.Size" in line:
-                continue
-
-            if not skip_next:
-                cleaned_lines.append(line)
-            else:
-                skip_next = False
-
-        captured = '\n'.join(cleaned_lines).strip()
-
-
-        logger.debug("Cleaned captured output: %d chars", len(captured))
-
-    # Clear GPU cache to prevent state pollution between pages
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        logger.debug("Cleared CUDA cache after inference")
-
-    # Save raw output for debugging if path provided
-    if debug_save_path:
-        try:
-            debug_save_path.write_text(captured if captured else "[EMPTY]", encoding="utf-8")
-            logger.debug("Saved raw output to: %s (%d chars)", debug_save_path.name, len(captured))
-        except Exception as e:
-            logger.warning("Failed to save debug output: %s", e)
 
     return captured, infer_time
 
@@ -1165,7 +1017,7 @@ def run_page_ocr(
         prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
         captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
         if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
+            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
             return page_ocr, infer_time, "ollama", resolution
         logger.warning("[%s] No grounding tags detected", page_id)
         img = Image.open(image_path).convert("RGB")
@@ -1173,8 +1025,7 @@ def run_page_ocr(
         return {"ocr": {"blocks": []}}, infer_time, "none", resolution
 
     logger.info("[%s] Inference (base)", page_id)
-    debug_path = page_dir / f"{page_id.replace('|', '_')}_raw_base.txt" if page_dir else None
-    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config, debug_save_path=debug_path)
+    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config)
 
     logger.debug("[%s] Base attempt captured %d chars", page_id, len(captured))
     if captured:
@@ -1185,15 +1036,14 @@ def run_page_ocr(
 
     if _has_grounding_tags(captured):
         logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
+        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
         return page_ocr, time_base, "base", resolution
 
     if not disable_fallbacks:
         logger.info("[%s] Inference (crop_mode fallback)", page_id)
         crop_config = dict(infer_config)
         crop_config["crop_mode"] = True
-        debug_path_crop = page_dir / f"{page_id.replace('|', '_')}_raw_crop.txt" if page_dir else None
-        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config, debug_save_path=debug_path_crop)
+        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config)
 
         logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
         if captured_crop:
@@ -1204,7 +1054,7 @@ def run_page_ocr(
 
         if _has_grounding_tags(captured_crop):
             logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id)
+            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger)
             return page_ocr, time_base + time_crop, "crop_mode", resolution
 
         total_time = time_base + time_crop
@@ -1272,7 +1122,7 @@ def _run_all_modes_experiment(
         try:
             logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
             t_start = time.time()
-            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=60)
+            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=99999)
             t_end = time.time()
             total_time += infer_time
 
@@ -1297,7 +1147,7 @@ def _run_all_modes_experiment(
             mode_blocks = []
             if success:
                 try:
-                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
+                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger)
                     mode_blocks = parsed_ocr.get("ocr", {}).get("blocks", [])
 
                     # Save bbox image for this mode
@@ -1478,19 +1328,8 @@ def process_document(
     """
     warnings_list: List[str] = []
     input_type = "pdf" if is_pdf(input_path) else "image"
-
-    # OmniDocBench format: use subdirectory only for page selections
-    if selection_label and selection_label != "all_pages":
-        selection_dir = output_root / selection_label
-    else:
-        selection_dir = output_root
+    selection_dir = output_root / selection_label
     selection_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create separate debug directory for artifacts
-    debug_dir = None
-    if cfg.debug_keep_renders or cfg.save_bbox_overlay:
-        debug_dir = selection_dir / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
 
     infer_config = inference_config if inference_config is not None else INFERENCE_CONFIG
 
@@ -1507,7 +1346,7 @@ def process_document(
             # Create debug directory for transformation images if debug is enabled
             debug_transforms_dir = None
             if cfg.debug_keep_renders:
-                debug_transforms_dir = debug_dir / "transforms" if debug_dir else selection_dir / "debug" / "transforms"
+                debug_transforms_dir = selection_dir / "debug_transforms"
                 debug_transforms_dir.mkdir(parents=True, exist_ok=True)
                 logger.info("Debug mode: Saving intermediate transformation images to %s", debug_transforms_dir)
 
@@ -1529,13 +1368,14 @@ def process_document(
         for page_index in selected_indices:
             position = page_index_to_position[page_index]
             page_path = page_image_paths[position]
+            page_dir = selection_dir / f"page_{page_index + 1}"
+            page_dir.mkdir(parents=True, exist_ok=True)
 
-            # OmniDocBench format: no per-page subdirectories
-            page_id = f"{input_path.stem}|P{page_index:04d}"
+            page_id = f"{input_path.stem}|P{page_index + 1:03d}"
 
-            if cfg.debug_keep_renders and debug_dir:
+            if cfg.debug_keep_renders:
                 try:
-                    _copy_image(page_path, debug_dir / f"page_{page_index:04d}_render.png")
+                    _copy_image(page_path, page_dir / "render.png")
                 except Exception as exc:
                     logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
 
@@ -1550,24 +1390,23 @@ def process_document(
                     disable_fallbacks=cfg.disable_fallbacks,
                     backend=cfg.backend,
                     test_all_modes=cfg.test_all_modes,
-                    page_dir=debug_dir,  # Pass debug_dir for any page-specific debug files
+                    page_dir=page_dir,
                 )
 
-                if cfg.save_bbox_overlay and debug_dir:
+                if cfg.save_bbox_overlay:
                     try:
-                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), debug_dir / f"page_{page_index:04d}_bbox.png")
+                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
                 # Analyze bbox distribution for edge detection issues
-                if debug_dir:
-                    try:
-                        bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
-                        bbox_analysis_path = debug_dir / f"page_{page_index:04d}_bbox_analysis.json"
-                        bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
-                        logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
-                    except Exception as exc:
-                        logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
+                try:
+                    bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
+                    bbox_analysis_path = page_dir / "bbox_analysis.json"
+                    bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+                    logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
+                except Exception as exc:
+                    logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -1612,8 +1451,7 @@ def process_document(
                     warnings=page_warnings if page_warnings else None,
                 )
 
-                # OmniDocBench format: page_XXXX.json with 0-based 4-digit padding
-                page_json_path = selection_dir / f"page_{page_index:04d}.json"
+                page_json_path = selection_dir / f"page_{page_index + 1}.json"
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 logger.debug("[%s] wrote %s", page_id, page_json_path.name)
 
@@ -1654,8 +1492,7 @@ def process_document(
                     blocks=[],
                     warnings=error_warnings,
                 )
-                # OmniDocBench format: page_XXXX.json with 0-based 4-digit padding
-                page_json_path = selection_dir / f"page_{page_index:04d}.json"
+                page_json_path = selection_dir / f"page_{page_index + 1}.json"
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 page_payload = {
