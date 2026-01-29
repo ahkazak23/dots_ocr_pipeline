@@ -92,7 +92,7 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 MAX_IMAGE_DIMENSION = 2000  # HuggingFace: 2000, Ollama: 1280 works better
 
-DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
+DEFAULT_PROMPT_EXTRACT_ALL = "image>\n<|grounding|>Convert the document to markdown. "
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
