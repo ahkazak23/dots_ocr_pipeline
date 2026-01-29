@@ -89,7 +89,7 @@ PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 # Mode-specific inference configurations
 INFERENCE_MODES = {
     "extract_all": {
-        "prompt": "<image>\n<|grounding|>Free OCR.",
+        "prompt": "<image>\n<|grounding|>Convert the document to markdown. ",
         "base_size": 1024,
         "image_size": 640,
         "crop_mode": True,  # Enable crop mode for edge detection
