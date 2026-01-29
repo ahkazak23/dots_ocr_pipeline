@@ -70,6 +70,7 @@ LABEL_TO_TYPE = {
     "text": "text_block",
     "title": "title",
     "table": "table",
+    "table_caption": "table",
     "image": "image",
     "diagram": "diagram",
     "header": "page_header",
@@ -1068,15 +1069,6 @@ def _run_inference(
 
         captured = '\n'.join(cleaned_lines).strip()
 
-        # Remove leading fragments from previous page (e.g., "769]]<|/det|>")
-        # These are incomplete closing tags that don't start with proper opening
-        if captured and not captured.startswith('<|ref|>'):
-            # Find the first proper <|ref|> tag
-            first_ref_pos = captured.find('<|ref|>')
-            if first_ref_pos > 0:
-                logger.warning("Removing %d char prefix fragment before first <|ref|> tag: %s",
-                             first_ref_pos, captured[:first_ref_pos][:100])
-                captured = captured[first_ref_pos:]
 
         logger.debug("Cleaned captured output: %d chars", len(captured))
 
