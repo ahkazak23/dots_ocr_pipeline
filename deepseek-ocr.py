@@ -27,7 +27,6 @@ import base64
 import urllib.request
 import urllib.error
 import threading
-from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -48,6 +47,7 @@ logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 
 try:
     from colorama import init as colorama_init, Fore, Style
+
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
@@ -55,6 +55,8 @@ except ImportError:
     class _DummyColor:
         def __getattr__(self, name):
             return ""
+
+
     Fore = _DummyColor()
     Style = _DummyColor()
     COLORS_AVAILABLE = False
@@ -70,6 +72,7 @@ LABEL_TO_TYPE = {
     "text": "text_block",
     "title": "title",
     "table": "table",
+    "table_caption": "table",
     "image": "image",
     "diagram": "diagram",
     "header": "page_header",
@@ -181,6 +184,7 @@ INFERENCE_CONFIG = {
     "test_compress": False,
 }
 
+
 # Logging
 
 class ColoredFormatter(logging.Formatter):
@@ -226,6 +230,7 @@ class Backend(str, enum.Enum):
     HUGGINGFACE = "huggingface"
     OLLAMA = "ollama"
 
+
 # Config
 
 @dataclass
@@ -267,7 +272,8 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
             return "cuda", "cuda"
         logger.warning("CUDA requested but not available; falling back to CPU")
         logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-        logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+        logger.info(
+            "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
         return "cpu", "cpu"
     if arg == "mps":
         if torch.backends.mps.is_available():
@@ -284,11 +290,13 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
         return "mps", "mps"
     logger.warning("No GPU available; using CPU")
     logger.warning("Inference will be significantly slower (~2-5 min/page vs ~10-30 sec/page)")
-    logger.info("To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+    logger.info(
+        "To enable GPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
     return "cpu", "cpu"
 
 
-def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> Tuple[Any, Any]:
+def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
+Tuple[Any, Any]:
     if backend == Backend.OLLAMA:
         logger.info("Using Ollama backend; model is managed by Ollama daemon")
         return None, None
@@ -320,13 +328,13 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
 
 
 def render_pdf_to_images(
-    pdf_path: Path,
-    dpi: int,
-    tmp_dir: Path,
-    logger: logging.Logger,
-    page_indices: Optional[List[int]] = None,
-    debug_save_dir: Optional[Path] = None,
-    disable_downscale: bool = False,
+        pdf_path: Path,
+        dpi: int,
+        tmp_dir: Path,
+        logger: logging.Logger,
+        page_indices: Optional[List[int]] = None,
+        debug_save_dir: Optional[Path] = None,
+        disable_downscale: bool = False,
 ) -> List[Path]:
     """Render selected PDF pages to images.
 
@@ -485,8 +493,8 @@ def _det_to_bbox_normalized(det_coords, img_w: int, img_h: int) -> List[float]:
 
 
 def classify_header_footer_heuristic(
-    blocks: List[Dict[str, Any]],
-    logger: Optional[logging.Logger] = None
+        blocks: List[Dict[str, Any]],
+        logger: Optional[logging.Logger] = None
 ) -> List[Dict[str, Any]]:
     """
     Classify blocks as page-header or page-footer based on heuristics.
@@ -753,11 +761,11 @@ def _clean_html(text: str) -> str:
 
 
 def build_spec_page_payload(
-    document_id: str,
-    page_id: str,
-    resolution: List[int],
-    blocks: List[Dict[str, Any]],
-    warnings: Optional[List[str]] = None,
+        document_id: str,
+        page_id: str,
+        resolution: List[int],
+        blocks: List[Dict[str, Any]],
+        warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build a per-page spec payload matching OmniDocBench format."""
     # Convert page_id to integer
@@ -783,10 +791,10 @@ def build_spec_page_payload(
 
 
 def parse_grounded_stdout(
-    captured: str,
-    image_path: Path,
-    logger: logging.Logger,
-    page_id: str = "",
+        captured: str,
+        image_path: Path,
+        logger: logging.Logger,
+        page_id: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
 
@@ -843,10 +851,10 @@ def parse_grounded_stdout(
 
         # Check for corrupted content
         is_corrupted = (
-            not content or
-            content.startswith("]]<|/det|>") or
-            "eee eee" in content.lower() or
-            len(content) < 2
+                not content or
+                content.startswith("]]<|/det|>") or
+                "eee eee" in content.lower() or
+                len(content) < 2
         )
 
         if is_corrupted:
@@ -925,12 +933,12 @@ def _has_grounding_tags(text: str) -> bool:
 
 
 def _run_inference(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    infer_config: Dict[str, Any],
-    timeout_seconds: int = 180,  # Increased from 60s to prevent truncated outputs
-    debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        infer_config: Dict[str, Any],
+        timeout_seconds: int = 600,  # Increased from 60s to prevent truncated outputs
+        debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
 ) -> Tuple[str, float]:
     """Run model inference and capture output with timeout.
 
@@ -977,27 +985,41 @@ def _run_inference(
     exception_msg = None
     timeout_occurred = False
 
+    # Save original stdout/stderr to restore later
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
     def _inference_worker():
         """Worker function to run inference in a thread."""
         nonlocal res, exception_msg
         try:
+            # Directly replace sys.stdout/stderr for more reliable capture
+            sys.stdout = out_buf
+            sys.stderr = err_buf
+
             with torch.inference_mode():
-                with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                    res = model.infer(
-                        tokenizer,
-                        prompt=prompt,
-                        image_file=str(image_path),
-                        output_path=str(image_path.parent),
-                        save_results=False,
-                        **config_for_infer,
-                    )
+                res = model.infer(
+                    tokenizer,
+                    prompt=prompt,
+                    image_file=str(image_path),
+                    output_path=str(image_path.parent),
+                    save_results=False,
+                    **config_for_infer,
+                )
         except Exception as exc:
             exception_msg = f"{type(exc).__name__}: {exc}"
+            # Restore stdout/stderr before logging
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
             logger.error("Inference exception in worker: %s", exception_msg)
+        finally:
+            # Always restore stdout/stderr when worker thread exits
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
-    # Start inference in a separate thread
+    # Start inference in a separate thread (non-daemon to ensure cleanup)
     logger.debug("Starting model.infer() in background thread with %ds timeout...", timeout_seconds)
-    worker_thread = threading.Thread(target=_inference_worker, daemon=True)
+    worker_thread = threading.Thread(target=_inference_worker, daemon=False)
     worker_thread.start()
 
     # Wait for completion or timeout
@@ -1008,12 +1030,25 @@ def _run_inference(
         timeout_occurred = True
         exception_msg = f"TimeoutException: Inference exceeded {timeout_seconds}s limit"
         logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
+        # Give thread a brief moment to write any buffered output
+        time.sleep(0.5)
         # Note: We can't actually kill the thread, but we can stop waiting for it
     else:
         logger.debug("model.infer() completed within timeout")
 
+    # Ensure stdout/stderr are restored in main thread (in case of early return or timeout)
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+
     infer_time = time.time() - t0
     logger.debug("Inference wall time: %.2fs", infer_time)
+
+    # Flush buffers to ensure all content is captured
+    try:
+        out_buf.flush()
+        err_buf.flush()
+    except Exception:
+        pass
 
     captured = ""
     if isinstance(res, str) and res.strip():
@@ -1036,10 +1071,10 @@ def _run_inference(
 
 
 def _run_ollama_inference(
-    image_path: Path,
-    logger: logging.Logger,
-    prompt: str,
-    model_name: str = "deepseek-ocr",
+        image_path: Path,
+        logger: logging.Logger,
+        prompt: str,
+        model_name: str = "deepseek-ocr",
 ) -> Tuple[str, float]:
     """Run inference via Ollama HTTP API with an image."""
     t0 = time.time()
@@ -1084,16 +1119,16 @@ def _run_ollama_inference(
 
 
 def run_page_ocr(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    infer_config: Dict[str, Any],
-    logger: logging.Logger,
-    page_id: str = "",
-    disable_fallbacks: bool = False,
-    backend: Backend = Backend.HUGGINGFACE,
-    test_all_modes: bool = False,
-    page_dir: Optional[Path] = None,
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        infer_config: Dict[str, Any],
+        logger: logging.Logger,
+        page_id: str = "",
+        disable_fallbacks: bool = False,
+        backend: Backend = Backend.HUGGINGFACE,
+        test_all_modes: bool = False,
+        page_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run OCR on a single rendered page image.
 
@@ -1140,7 +1175,8 @@ def run_page_ocr(
         crop_config = dict(infer_config)
         crop_config["crop_mode"] = True
         debug_path_crop = page_dir / f"{page_id.replace('|', '_')}_raw_crop.txt" if page_dir else None
-        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config, debug_save_path=debug_path_crop)
+        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config,
+                                                  debug_save_path=debug_path_crop)
 
         logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
         if captured_crop:
@@ -1167,12 +1203,12 @@ def run_page_ocr(
 
 
 def _run_all_modes_experiment(
-    model: Any,
-    tokenizer: Any,
-    image_path: Path,
-    logger: logging.Logger,
-    page_id: str,
-    page_dir: Optional[Path] = None,
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        logger: logging.Logger,
+        page_id: str,
+        page_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run all inference modes on a page and log timing results.
 
@@ -1203,7 +1239,7 @@ def _run_all_modes_experiment(
     total_time = 0.0
 
     for idx, (mode_name, mode_config) in enumerate(INFERENCE_MODES.items(), 1):
-        logger.info("[%s] " + "="*60, page_id)
+        logger.info("[%s] " + "=" * 60, page_id)
         logger.info("[%s] Testing mode %d/%d: %s", page_id, idx, len(INFERENCE_MODES), mode_name)
         logger.debug("[%s]   base_size: %d", page_id, mode_config.get("base_size", 1024))
         logger.debug("[%s]   image_size: %d", page_id, mode_config.get("image_size", 640))
@@ -1288,10 +1324,10 @@ def _run_all_modes_experiment(
             status = "✓ SUCCESS" if success else "✗ FAILED"
             if success:
                 logger.info("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d | blocks=%d",
-                           page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count, len(mode_blocks))
+                            page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count, len(mode_blocks))
             else:
                 logger.warning("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d",
-                              page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count)
+                               page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count)
 
             if success and first_success is None:
                 logger.info("[%s] First successful mode: %s", page_id, mode_name)
@@ -1311,7 +1347,7 @@ def _run_all_modes_experiment(
             })
 
     # Log summary
-    logger.info("[%s] " + "="*60, page_id)
+    logger.info("[%s] " + "=" * 60, page_id)
     logger.info("[%s] === EXPERIMENT SUMMARY ===", page_id)
     logger.info("[%s] Total modes tested: %d", page_id, len(results))
     logger.info("[%s] Total time: %.1fs (%.1f min)", page_id, total_time, total_time / 60)
@@ -1347,7 +1383,7 @@ def _run_all_modes_experiment(
         "results": results,
     }, indent=2), encoding="utf-8")
     logger.info("[%s] Mode comparison JSON saved to: %s", page_id, str(results_file.resolve()))
-    logger.info("[%s] " + "="*60, page_id)
+    logger.info("[%s] " + "=" * 60, page_id)
 
     if first_success:
         page_ocr, mode_used = first_success
@@ -1405,18 +1441,18 @@ def _copy_image(src: Path, dst: Path) -> None:
 
 
 def process_document(
-    model: Any,
-    tokenizer: Any,
-    input_path: Path,
-    cfg: Config,
-    output_root: Path,
-    selection_label: str,
-    logger: logging.Logger,
-    pages: Optional[List[int]] = None,
-    page_range: Optional[str] = None,
-    backend: Backend = Backend.HUGGINGFACE,
-    inference_config: Optional[Dict[str, Any]] = None,
-    legacy_document_json: bool = False,
+        model: Any,
+        tokenizer: Any,
+        input_path: Path,
+        cfg: Config,
+        output_root: Path,
+        selection_label: str,
+        logger: logging.Logger,
+        pages: Optional[List[int]] = None,
+        page_range: Optional[str] = None,
+        backend: Backend = Backend.HUGGINGFACE,
+        inference_config: Optional[Dict[str, Any]] = None,
+        legacy_document_json: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Process one input document and write per-page outputs.
 
@@ -1459,7 +1495,8 @@ def process_document(
                 logger.info("Debug mode: Saving intermediate transformation images to %s", debug_transforms_dir)
 
             page_image_paths = render_pdf_to_images(
-                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices, debug_save_dir=debug_transforms_dir, disable_downscale=cfg.disable_downscale
+                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices,
+                debug_save_dir=debug_transforms_dir, disable_downscale=cfg.disable_downscale
             )
         else:
             page_image_paths = [input_path]
@@ -1502,7 +1539,8 @@ def process_document(
 
                 if cfg.save_bbox_overlay and debug_dir:
                     try:
-                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), debug_dir / f"page_{page_index:04d}_bbox.png")
+                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []),
+                                        debug_dir / f"page_{page_index:04d}_bbox.png")
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
@@ -1511,10 +1549,12 @@ def process_document(
                     try:
                         bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
                         bbox_analysis_path = debug_dir / f"page_{page_index:04d}_bbox_analysis.json"
-                        bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+                        bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2),
+                                                      encoding="utf-8")
                         logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
                     except Exception as exc:
-                        logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
+                        logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__,
+                                       exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -1529,8 +1569,6 @@ def process_document(
                     block_type = blk.get("type", "paragraph")
                     bbox = blk.get("bbox", [0, 0, 0, 0])
 
-
-
                     spec_blocks.append(
                         {
                             "type": block_type,
@@ -1540,7 +1578,6 @@ def process_document(
                             "extraction_response_parsed": blk["extraction_response_parsed"],
                         }
                     )
-
 
                 page_warnings: List[str] = []
                 if attempt_used == "none":
@@ -1682,12 +1719,12 @@ def gather_inputs(input_arg: Path) -> List[Path]:
 
 
 def write_run_summary(
-    eval_dir: Path,
-    run_items: List[Dict[str, Any]],
-    total_time: float,
-    total_pages: int,
-    device: str,
-    model: str,
+        eval_dir: Path,
+        run_items: List[Dict[str, Any]],
+        total_time: float,
+        total_pages: int,
+        device: str,
+        model: str,
 ) -> Path:
     eval_dir.mkdir(parents=True, exist_ok=True)
     ts_filename = time.strftime("%Y%m%d_%H%M%S")
@@ -1715,8 +1752,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--revision", default=None, help="Optional model revision")
     parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
     parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level")
-    parser.add_argument("--keep-renders", action="store_true", help="Persist rendered page images under page folders (recommended)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Console log level")
+    parser.add_argument("--keep-renders", action="store_true",
+                        help="Persist rendered page images under page folders (recommended)")
     parser.add_argument(
         "--no-bbox-overlay",
         action="store_true",
@@ -1733,7 +1772,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="[DEPRECATED] Use --enable-fallbacks instead. Fallbacks are now disabled by default.",
     )
-    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend], help="Backend: huggingface or ollama")
+    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend],
+                        help="Backend: huggingface or ollama")
     parser.add_argument(
         "--mode",
         default="extract_all",
@@ -1745,10 +1785,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
     )
-    parser.add_argument("--test-compress", action="store_true", help="Enable test_compress mode for compression diagnostics")
+    parser.add_argument("--test-compress", action="store_true",
+                        help="Enable test_compress mode for compression diagnostics")
     parser.add_argument("--base-size", type=int, default=None, help="Override base_size (e.g., 512, 768, 1024, 1280)")
-    parser.add_argument("--image-size", type=int, default=None, help="Override image_size (e.g., 384, 512, 640, 768, 896)")
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Maximum tokens to generate (default: model default)")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="Override image_size (e.g., 384, 512, 640, 768, 896)")
+    parser.add_argument("--max-new-tokens", type=int, default=None,
+                        help="Maximum tokens to generate (default: model default)")
     parser.add_argument(
         "--legacy-document-json",
         action="store_true",
@@ -1930,7 +1973,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-
 def analyze_bbox_distribution(blocks: List[Dict[str, Any]], logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Analyze spatial distribution of bounding boxes to detect edge text detection issues.
 
@@ -2013,13 +2055,13 @@ def analyze_bbox_distribution(blocks: List[Dict[str, Any]], logger: Optional[log
 
     if logger:
         logger.info("[BBOX_ANALYSIS] %d blocks | y: %.3f-%.3f | Top edge: %d (%.1f%%) | Bottom edge: %d (%.1f%%)",
-                   len(blocks),
-                   stats["y_distribution"]["min"],
-                   stats["y_distribution"]["max"],
-                   top_edge_blocks,
-                   stats["edge_coverage"]["top_edge_pct"],
-                   bottom_edge_blocks,
-                   stats["edge_coverage"]["bottom_edge_pct"])
+                    len(blocks),
+                    stats["y_distribution"]["min"],
+                    stats["y_distribution"]["max"],
+                    top_edge_blocks,
+                    stats["edge_coverage"]["top_edge_pct"],
+                    bottom_edge_blocks,
+                    stats["edge_coverage"]["bottom_edge_pct"])
         for warning in stats["warnings"]:
             logger.warning("[BBOX_ANALYSIS] %s", warning)
 
