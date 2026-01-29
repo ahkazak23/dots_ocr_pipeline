@@ -231,12 +231,12 @@ class Backend(str, enum.Enum):
 @dataclass
 class Config:
     """Configuration for DeepSeek-OCR pipeline."""
-    model: str = "deepseek-ai/DeepSeek-OCR"
+    model: str = "deepseek-ai/DeepSeek-OCR-2"
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
     eval_out_dir: str = "./evaluation_output"
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
     debug_keep_renders: bool = True
     save_bbox_overlay: bool = True
     disable_fallbacks: bool = False
@@ -300,22 +300,50 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "use_safetensors": True,
-        "torch_dtype": torch.bfloat16 if device in ("cuda", "mps") else torch.float32,
     }
+
     if revision:
         tokenizer_kwargs["revision"] = revision
         model_kwargs["revision"] = revision
 
+    # Determine dtype based on GPU capability (bf16 for compute capability >= 8.0, else fp16)
+    dtype = None
     if device == "cuda":
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            dtype = torch.bfloat16 if major >= 8 else torch.float16
+            logger.info("Using dtype: %s (GPU compute capability: %d.%d)", dtype, major, minor)
+        except Exception:
+            dtype = torch.float16
+            logger.info("Using dtype: %s (fallback)", dtype)
+
+        model_kwargs["torch_dtype"] = dtype
         model_kwargs["device_map"] = {"": 0}
+
+        # Try to use flash attention 2 if available
+        try:
+            model_kwargs["_attn_implementation"] = "flash_attention_2"
+            logger.info("Attempting to use flash_attention_2")
+        except Exception:
+            logger.info("flash_attention_2 not available, using default attention")
+
     elif device == "mps":
+        model_kwargs["torch_dtype"] = torch.bfloat16
         model_kwargs["device_map"] = "mps"
     else:
+        model_kwargs["torch_dtype"] = torch.float32
         model_kwargs["device_map"] = "cpu"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
     model = AutoModel.from_pretrained(model_name, **model_kwargs).eval()
-    logger.info("Model loaded")
+
+    # Apply dtype conversion for CUDA
+    if device == "cuda" and dtype is not None:
+        model = model.to(dtype)
+        logger.info("Model loaded with dtype: %s", dtype)
+    else:
+        logger.info("Model loaded")
+
     return model, tokenizer
 
 
