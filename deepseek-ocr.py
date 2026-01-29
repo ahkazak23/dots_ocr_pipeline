@@ -67,15 +67,15 @@ REF_RE = re.compile(
 )
 
 LABEL_TO_TYPE = {
-    "text": "paragraph",
-    "title": "paragraph",
+    "text": "text_block",
+    "title": "title",
     "table": "table",
     "image": "image",
     "diagram": "diagram",
-    "header": "page-header",
-    "footer": "page-footer",
-    "page-header": "page-header",
-    "page-footer": "page-footer",
+    "header": "page_header",
+    "footer": "page_footer",
+    "page-header": "page_header",
+    "page-footer": "page_footer",
 }
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
@@ -692,6 +692,66 @@ def try_parse_markdown_table(md: str) -> Optional[Dict[str, Any]]:
     return {"columns": columns, "rows": rows}
 
 
+def try_parse_html_table(html: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse HTML table into structured data.
+    Returns {"headers": [...], "rows": [[...], ...]} or None if parsing fails.
+    """
+    if not html or "<table>" not in html.lower():
+        return None
+
+    # Simple regex-based HTML table parsing
+    # Extract all <tr> tags
+    tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.IGNORECASE | re.DOTALL)
+    tr_matches = tr_pattern.findall(html)
+
+    if not tr_matches:
+        return None
+
+    headers = []
+    rows = []
+
+    for i, tr_content in enumerate(tr_matches):
+        # Check if this is a header row (contains <th> tags)
+        th_pattern = re.compile(r'<th[^>]*>(.*?)</th>', re.IGNORECASE | re.DOTALL)
+        td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.IGNORECASE | re.DOTALL)
+
+        th_matches = th_pattern.findall(tr_content)
+        td_matches = td_pattern.findall(tr_content)
+
+        if th_matches and i == 0:
+            # First row with <th> tags is the header
+            headers = [_clean_html(cell) for cell in th_matches]
+        elif td_matches:
+            # Data row
+            row = [_clean_html(cell) for cell in td_matches]
+            rows.append(row)
+        elif th_matches and not headers:
+            # Fallback: treat <th> as headers even if not first row
+            headers = [_clean_html(cell) for cell in th_matches]
+
+    # If we found headers and rows, return structured data
+    if headers or rows:
+        return {"headers": headers, "rows": rows}
+
+    return None
+
+
+def _clean_html(text: str) -> str:
+    """Remove HTML tags and clean up text."""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Decode HTML entities
+    text = text.replace('&nbsp;', ' ')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&amp;', '&')
+    text = text.replace('&quot;', '"')
+    # Clean up whitespace
+    text = ' '.join(text.split())
+    return text.strip()
+
+
 def build_spec_page_payload(
     document_id: str,
     page_id: str,
@@ -699,11 +759,20 @@ def build_spec_page_payload(
     blocks: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build a per-page spec payload."""
+    """Build a per-page spec payload matching OmniDocBench format."""
+    # Convert page_id to integer
+    try:
+        page_id_int = int(page_id)
+    except (ValueError, TypeError):
+        page_id_int = 0
+
     payload = {
-        "document_id": document_id,
-        "page_id": page_id,
-        "resolution": resolution,
+        "meta": {
+            "document_id": document_id,
+            "page_id": page_id_int,
+            "page_resolution": resolution,
+            "warnings": warnings if warnings else [],
+        },
         "ocr": {"blocks": blocks},
     }
 
@@ -717,8 +786,15 @@ def parse_grounded_stdout(
     captured: str,
     image_path: Path,
     logger: logging.Logger,
+    page_id: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
+
+    Args:
+        captured: Raw model output text
+        image_path: Path to the image file
+        logger: Logger instance
+        page_id: Page identifier for logging context
 
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
@@ -726,6 +802,9 @@ def parse_grounded_stdout(
     img = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     resolution = [img_w, img_h]
+
+    logger.debug("[%s] Parsing grounded output: image=%s (%dx%d), captured_len=%d",
+                 page_id or "UNKNOWN", image_path.name, img_w, img_h, len(captured))
 
     matches = list(REF_RE.finditer(captured))
     blocks: List[Dict[str, Any]] = []
@@ -798,24 +877,30 @@ def parse_grounded_stdout(
                 det_text[:100],
             )
 
-        block_type = LABEL_TO_TYPE.get(label, "paragraph")
+        block_type = LABEL_TO_TYPE.get(label, "text_block")
 
         if block_type == "table":
-            table_data = try_parse_markdown_table(content)
+            # Try parsing HTML table first, then fall back to Markdown
+            table_data = try_parse_html_table(content)
+            if table_data is None:
+                table_data = try_parse_markdown_table(content)
             parsed_payload = {"data": table_data, "text": normalize_text(content)}
         elif block_type == "image":
             parsed_payload = {"data": None, "text": ""}
         else:
             parsed_payload = {"data": None, "text": normalize_text(content)}
 
-        # BBox overlay expects legacy blocks with id/order.
+        # Build block matching OmniDocBench format
+        # Keep id/order for backward compatibility with bbox overlay tools
         legacy_block = {
-            "id": f"blk_{len(blocks) + 1}",
             "type": block_type,
-            "order": len(blocks),
             "bbox": bbox,
+            "extraction_origin": "deepseek-ocr",
             "extraction_response": content,
             "extraction_response_parsed": parsed_payload,
+            # Legacy fields for bbox overlay compatibility
+            "id": f"blk_{len(blocks) + 1}",
+            "order": len(blocks),
         }
         blocks.append(legacy_block)
 
@@ -844,9 +929,18 @@ def _run_inference(
     tokenizer: Any,
     image_path: Path,
     infer_config: Dict[str, Any],
-    timeout_seconds: int = 9999,  # Increased from 60s to prevent truncated outputs
+    timeout_seconds: int = 180,  # Increased from 60s to prevent truncated outputs
+    debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
 ) -> Tuple[str, float]:
     """Run model inference and capture output with timeout.
+
+    Args:
+        model: The model instance
+        tokenizer: The tokenizer instance
+        image_path: Path to input image
+        infer_config: Inference configuration dictionary
+        timeout_seconds: Maximum time to wait for inference
+        debug_save_path: If provided, save raw model output to this file
 
     Returns:
         (captured_text, inference_time_sec)
@@ -854,6 +948,7 @@ def _run_inference(
     logger = logging.getLogger("deepseek_ocr")
 
     t0 = time.time()
+    # Create fresh StringIO buffers for this inference
     out_buf = StringIO()
     err_buf = StringIO()
 
@@ -1017,7 +1112,7 @@ def run_page_ocr(
         prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
         captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
         if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
+            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
             return page_ocr, infer_time, "ollama", resolution
         logger.warning("[%s] No grounding tags detected", page_id)
         img = Image.open(image_path).convert("RGB")
@@ -1025,7 +1120,8 @@ def run_page_ocr(
         return {"ocr": {"blocks": []}}, infer_time, "none", resolution
 
     logger.info("[%s] Inference (base)", page_id)
-    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config)
+    debug_path = page_dir / f"{page_id.replace('|', '_')}_raw_base.txt" if page_dir else None
+    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config, debug_save_path=debug_path)
 
     logger.debug("[%s] Base attempt captured %d chars", page_id, len(captured))
     if captured:
@@ -1036,14 +1132,15 @@ def run_page_ocr(
 
     if _has_grounding_tags(captured):
         logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger)
+        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
         return page_ocr, time_base, "base", resolution
 
     if not disable_fallbacks:
         logger.info("[%s] Inference (crop_mode fallback)", page_id)
         crop_config = dict(infer_config)
         crop_config["crop_mode"] = True
-        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config)
+        debug_path_crop = page_dir / f"{page_id.replace('|', '_')}_raw_crop.txt" if page_dir else None
+        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config, debug_save_path=debug_path_crop)
 
         logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
         if captured_crop:
@@ -1054,7 +1151,7 @@ def run_page_ocr(
 
         if _has_grounding_tags(captured_crop):
             logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger)
+            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id)
             return page_ocr, time_base + time_crop, "crop_mode", resolution
 
         total_time = time_base + time_crop
@@ -1122,7 +1219,7 @@ def _run_all_modes_experiment(
         try:
             logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
             t_start = time.time()
-            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=99999)
+            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=60)
             t_end = time.time()
             total_time += infer_time
 
@@ -1147,7 +1244,7 @@ def _run_all_modes_experiment(
             mode_blocks = []
             if success:
                 try:
-                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger)
+                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
                     mode_blocks = parsed_ocr.get("ocr", {}).get("blocks", [])
 
                     # Save bbox image for this mode
@@ -1328,8 +1425,19 @@ def process_document(
     """
     warnings_list: List[str] = []
     input_type = "pdf" if is_pdf(input_path) else "image"
-    selection_dir = output_root / selection_label
+
+    # OmniDocBench format: use subdirectory only for page selections
+    if selection_label and selection_label != "all_pages":
+        selection_dir = output_root / selection_label
+    else:
+        selection_dir = output_root
     selection_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create separate debug directory for artifacts
+    debug_dir = None
+    if cfg.debug_keep_renders or cfg.save_bbox_overlay:
+        debug_dir = selection_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
     infer_config = inference_config if inference_config is not None else INFERENCE_CONFIG
 
@@ -1346,7 +1454,7 @@ def process_document(
             # Create debug directory for transformation images if debug is enabled
             debug_transforms_dir = None
             if cfg.debug_keep_renders:
-                debug_transforms_dir = selection_dir / "debug_transforms"
+                debug_transforms_dir = debug_dir / "transforms" if debug_dir else selection_dir / "debug" / "transforms"
                 debug_transforms_dir.mkdir(parents=True, exist_ok=True)
                 logger.info("Debug mode: Saving intermediate transformation images to %s", debug_transforms_dir)
 
@@ -1368,14 +1476,13 @@ def process_document(
         for page_index in selected_indices:
             position = page_index_to_position[page_index]
             page_path = page_image_paths[position]
-            page_dir = selection_dir / f"page_{page_index + 1}"
-            page_dir.mkdir(parents=True, exist_ok=True)
 
-            page_id = f"{input_path.stem}|P{page_index + 1:03d}"
+            # OmniDocBench format: no per-page subdirectories
+            page_id = f"{input_path.stem}|P{page_index:04d}"
 
-            if cfg.debug_keep_renders:
+            if cfg.debug_keep_renders and debug_dir:
                 try:
-                    _copy_image(page_path, page_dir / "render.png")
+                    _copy_image(page_path, debug_dir / f"page_{page_index:04d}_render.png")
                 except Exception as exc:
                     logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
 
@@ -1390,23 +1497,24 @@ def process_document(
                     disable_fallbacks=cfg.disable_fallbacks,
                     backend=cfg.backend,
                     test_all_modes=cfg.test_all_modes,
-                    page_dir=page_dir,
+                    page_dir=debug_dir,  # Pass debug_dir for any page-specific debug files
                 )
 
-                if cfg.save_bbox_overlay:
+                if cfg.save_bbox_overlay and debug_dir:
                     try:
-                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), page_dir / "page_bbox.png")
+                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []), debug_dir / f"page_{page_index:04d}_bbox.png")
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
                 # Analyze bbox distribution for edge detection issues
-                try:
-                    bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
-                    bbox_analysis_path = page_dir / "bbox_analysis.json"
-                    bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
-                    logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
-                except Exception as exc:
-                    logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
+                if debug_dir:
+                    try:
+                        bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
+                        bbox_analysis_path = debug_dir / f"page_{page_index:04d}_bbox_analysis.json"
+                        bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+                        logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
+                    except Exception as exc:
+                        logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__, exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -1451,7 +1559,8 @@ def process_document(
                     warnings=page_warnings if page_warnings else None,
                 )
 
-                page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                # OmniDocBench format: page_XXXX.json with 0-based 4-digit padding
+                page_json_path = selection_dir / f"page_{page_index:04d}.json"
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 logger.debug("[%s] wrote %s", page_id, page_json_path.name)
 
@@ -1492,7 +1601,8 @@ def process_document(
                     blocks=[],
                     warnings=error_warnings,
                 )
-                page_json_path = selection_dir / f"page_{page_index + 1}.json"
+                # OmniDocBench format: page_XXXX.json with 0-based 4-digit padding
+                page_json_path = selection_dir / f"page_{page_index:04d}.json"
                 page_json_path.write_text(json.dumps(spec_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 page_payload = {
