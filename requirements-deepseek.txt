@@ -4,6 +4,8 @@
 # Core dependencies
 pillow>=11.3.0
 PyMuPDF>=1.26.7
+pytesseract>=0.3.10  # For automatic page rotation detection
+
 
 # PyTorch (DeepSeek officially uses 2.6.0, but 2.7.0 should work)
 torch==2.6.0

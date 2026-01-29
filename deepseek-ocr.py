@@ -37,6 +37,14 @@ import torch
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer
 
+# Try to import pytesseract for rotation detection
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+    pytesseract = None
+
 # Suppress all transformer warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -327,6 +335,40 @@ Tuple[Any, Any]:
     return model, tokenizer
 
 
+def detect_page_rotation(img: Image.Image, logger: logging.Logger) -> int:
+    """
+    Detect page rotation using Tesseract OSD (Orientation and Script Detection).
+
+    Args:
+        img: PIL Image to analyze
+        logger: Logger instance
+
+    Returns:
+        Rotation angle in degrees (0, 90, 180, or 270)
+    """
+    if not PYTESSERACT_AVAILABLE:
+        logger.debug("pytesseract not available; skipping rotation detection")
+        return 0
+
+    try:
+        # Use Tesseract's OSD to detect orientation
+        osd_data = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        rotation = osd_data.get("rotate", 0)
+        confidence = osd_data.get("orientation_conf", 0.0)
+
+        logger.debug("[ROTATION] Detected rotation=%d° (confidence=%.1f%%)", rotation, confidence)
+
+        # Only trust high-confidence detections
+        if confidence < 1.0:
+            logger.debug("[ROTATION] Low confidence (%.1f%%), skipping rotation", confidence)
+            return 0
+
+        return int(rotation)
+    except Exception as exc:
+        logger.debug("[ROTATION] Detection failed: %s: %s", type(exc).__name__, exc)
+        return 0
+
+
 def render_pdf_to_images(
         pdf_path: Path,
         dpi: int,
@@ -384,6 +426,24 @@ def render_pdf_to_images(
 
         original_size = img.size
         was_downscaled = False
+        was_rotated = False
+        detected_rotation = 0
+
+        # Detect and correct page rotation using Tesseract OSD
+        detected_rotation = detect_page_rotation(img, logger)
+        if detected_rotation > 0:
+            # Rotate image to correct orientation
+            # Tesseract returns counterclockwise rotation needed, PIL rotates counterclockwise by default
+            img = img.rotate(-detected_rotation, expand=True, resample=Image.Resampling.BICUBIC)
+            was_rotated = True
+            logger.info(
+                "[RENDER][P%03d] Rotation correction: detected=%d° → rotated %d° (new size: %dx%d)",
+                page_index + 1,
+                detected_rotation,
+                -detected_rotation,
+                img.size[0],
+                img.size[1]
+            )
 
         # Save Step 1: Original render (after DPI scaling, before MAX_IMAGE_DIMENSION)
         if debug_save_dir:
