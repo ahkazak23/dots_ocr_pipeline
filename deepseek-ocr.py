@@ -33,28 +33,18 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Suppress TensorFlow/XLA warnings BEFORE importing torch/transformers
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logs (0=all, 3=errors only)
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN custom ops messages
-os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'  # Disable transformers warnings
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Avoid tokenizer parallelism warnings
-
-# Suppress Python warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
 import fitz  # PyMuPDF
 import torch
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer
 
-# Suppress transformers/torch logging
+# Suppress all transformer warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 logging.getLogger("transformers.generation").setLevel(logging.ERROR)
-logging.getLogger("torch").setLevel(logging.ERROR)
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 try:
     from colorama import init as colorama_init, Fore, Style
@@ -241,7 +231,7 @@ class Backend(str, enum.Enum):
 @dataclass
 class Config:
     """Configuration for DeepSeek-OCR pipeline."""
-    model: str = "deepseek-ai/DeepSeek-OCR"
+    model: str = "deepseek-ai/DeepSeek-OCR-2"
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
@@ -310,73 +300,22 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "use_safetensors": True,
+        "torch_dtype": torch.bfloat16 if device in ("cuda", "mps") else torch.float32,
     }
-
     if revision:
         tokenizer_kwargs["revision"] = revision
         model_kwargs["revision"] = revision
 
-    # Determine dtype based on GPU capability (bf16 for compute capability >= 8.0, else fp16)
-    dtype = None
     if device == "cuda":
-        try:
-            major, minor = torch.cuda.get_device_capability(0)
-            dtype = torch.bfloat16 if major >= 8 else torch.float16
-            logger.info("Using dtype: %s (GPU compute capability: %d.%d)", dtype, major, minor)
-        except Exception:
-            dtype = torch.float16
-            logger.info("Using dtype: %s (fallback)", dtype)
-
-        model_kwargs["torch_dtype"] = dtype
         model_kwargs["device_map"] = {"": 0}
-
-        # Try to use flash attention 2 if available
-        try:
-            model_kwargs["_attn_implementation"] = "flash_attention_2"
-            logger.info("Attempting to use flash_attention_2")
-        except Exception:
-            logger.info("flash_attention_2 not available, using default attention")
-
     elif device == "mps":
-        model_kwargs["torch_dtype"] = torch.bfloat16
         model_kwargs["device_map"] = "mps"
     else:
-        model_kwargs["torch_dtype"] = torch.float32
         model_kwargs["device_map"] = "cpu"
 
-    # Suppress TensorFlow/XLA stderr warnings during model loading
-    # These are harmless "already registered" messages that clutter the logs
-    import contextlib
-
-    # Create a context manager to suppress stderr
-    @contextlib.contextmanager
-    def suppress_stderr():
-        """Temporarily redirect stderr to devnull to hide TF/XLA warnings"""
-        stderr_fd = sys.stderr.fileno()
-        old_stderr = os.dup(stderr_fd)
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        try:
-            os.dup2(devnull, stderr_fd)
-            yield
-        finally:
-            os.dup2(old_stderr, stderr_fd)
-            os.close(devnull)
-            os.close(old_stderr)
-
-    logger.debug("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
-
-    logger.debug("Loading model (suppressing TF/XLA warnings)...")
-    with suppress_stderr():
-        model = AutoModel.from_pretrained(model_name, **model_kwargs).eval()
-
-    # Apply dtype conversion for CUDA
-    if device == "cuda" and dtype is not None:
-        model = model.to(dtype)
-        logger.info("Model loaded with dtype: %s", dtype)
-    else:
-        logger.info("Model loaded")
-
+    model = AutoModel.from_pretrained(model_name, **model_kwargs).eval()
+    logger.info("Model loaded")
     return model, tokenizer
 
 
@@ -865,39 +804,10 @@ def parse_grounded_stdout(
     logger.debug("[%s] Parsing grounded output: image=%s (%dx%d), captured_len=%d",
                  page_id or "UNKNOWN", image_path.name, img_w, img_h, len(captured))
 
-    # Extract prefix text if present
-    prefix_text = ""
-    if "<|PREFIX_TEXT|>" in captured:
-        prefix_start = captured.find("<|PREFIX_TEXT|>")
-        prefix_end = captured.find("<|/PREFIX_TEXT|>")
-        if prefix_start >= 0 and prefix_end > prefix_start:
-            prefix_text = captured[prefix_start + len("<|PREFIX_TEXT|>"):prefix_end].strip()
-            # Remove the prefix markers from captured text
-            captured = captured[:prefix_start] + captured[prefix_end + len("<|/PREFIX_TEXT|>"):]
-            logger.info("[%s] Extracted prefix text (%d chars): %s%s",
-                       page_id, len(prefix_text),
-                       prefix_text[:80],
-                       "..." if len(prefix_text) > 80 else "")
-
     matches = list(REF_RE.finditer(captured))
     blocks: List[Dict[str, Any]] = []
     bbox_parse_failures = 0
     malformed_tags = 0
-
-    # If we have prefix text, add it as the first block with a full-page bbox
-    # This preserves text that appeared without grounding tags
-    if prefix_text:
-        prefix_block = {
-            "type": "text_block",
-            "bbox": [0.0, 0.0, 1.0, 0.05],  # Top 5% of page (typical header area)
-            "extraction_origin": "deepseek-ocr-prefix",
-            "extraction_response": prefix_text,
-            "extraction_response_parsed": {"data": None, "text": normalize_text(prefix_text)},
-            "id": "blk_0_prefix",
-            "order": -1,  # Place before other blocks
-            "note": "Text extracted without bounding box tags (likely header/watermark)"
-        }
-        blocks.append(prefix_block)
 
     # Check for malformed grounding tags (incomplete <|det|> or corrupted output)
     if "<|ref|>" in captured:
@@ -1158,26 +1068,17 @@ def _run_inference(
 
         captured = '\n'.join(cleaned_lines).strip()
 
-        # Extract leading fragments before proper grounding tags
-        # These contain text without bounding boxes that should be preserved
-        prefix_text = ""
+        # Remove leading fragments from previous page (e.g., "769]]<|/det|>")
+        # These are incomplete closing tags that don't start with proper opening
         if captured and not captured.startswith('<|ref|>'):
             # Find the first proper <|ref|> tag
             first_ref_pos = captured.find('<|ref|>')
             if first_ref_pos > 0:
-                prefix_text = captured[:first_ref_pos].strip()
-                logger.info("Found %d char prefix text (no bbox tags): %s%s",
-                           len(prefix_text),
-                           prefix_text[:80],
-                           "..." if len(prefix_text) > 80 else "")
+                logger.warning("Removing %d char prefix fragment before first <|ref|> tag: %s",
+                             first_ref_pos, captured[:first_ref_pos][:100])
                 captured = captured[first_ref_pos:]
 
         logger.debug("Cleaned captured output: %d chars", len(captured))
-
-        # Store prefix_text in the captured output as a special marker
-        # We'll extract it later in parse_grounded_stdout
-        if prefix_text:
-            captured = f"<|PREFIX_TEXT|>{prefix_text}<|/PREFIX_TEXT|>" + captured
 
     # Clear GPU cache to prevent state pollution between pages
     if torch.cuda.is_available():
