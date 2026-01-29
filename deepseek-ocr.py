@@ -231,7 +231,7 @@ class Backend(str, enum.Enum):
 @dataclass
 class Config:
     """Configuration for DeepSeek-OCR pipeline."""
-    model: str = "deepseek-ai/DeepSeek-OCR-2"
+    model: str = "deepseek-ai/DeepSeek-OCR"
     backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
