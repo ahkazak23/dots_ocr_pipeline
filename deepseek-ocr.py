@@ -1604,17 +1604,6 @@ def process_document(
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
-                # Analyze bbox distribution for edge detection issues
-                if debug_dir:
-                    try:
-                        bbox_stats = analyze_bbox_distribution(page_ocr.get("ocr", {}).get("blocks", []), logger)
-                        bbox_analysis_path = debug_dir / f"page_{page_index:04d}_bbox_analysis.json"
-                        bbox_analysis_path.write_text(json.dumps(bbox_stats, ensure_ascii=False, indent=2),
-                                                      encoding="utf-8")
-                        logger.debug("[%s] Bbox analysis saved to %s", page_id, bbox_analysis_path.name)
-                    except Exception as exc:
-                        logger.warning("[%s] failed to analyze bbox distribution: %s: %s", page_id, type(exc).__name__,
-                                       exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -2031,102 +2020,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Run summary saved to %s", summary_path)
     logger.info("Elapsed wall time: %.2fs (model load included)", run_total_time)
     return 0
-
-
-def analyze_bbox_distribution(blocks: List[Dict[str, Any]], logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """Analyze spatial distribution of bounding boxes to detect edge text detection issues.
-
-    Returns:
-        Statistics dict with y-coordinate distribution, edge zone coverage, etc.
-    """
-    if not blocks:
-        return {
-            "block_count": 0,
-            "error": "No blocks to analyze"
-        }
-
-    y_coords = []
-    x_coords = []
-    top_edge_blocks = 0  # y < 0.15
-    bottom_edge_blocks = 0  # y > 0.85
-    left_edge_blocks = 0  # x < 0.15
-    right_edge_blocks = 0  # x > 0.85
-
-    for blk in blocks:
-        bbox = blk.get("bbox")
-        if not (isinstance(bbox, list) and len(bbox) == 4):
-            continue
-
-        # bbox is [x1, y1, x2, y2] in normalized 0-1 coordinates
-        x1, y1, x2, y2 = bbox
-        y_coords.append(y1)
-        x_coords.append(x1)
-
-        # Check edge zones
-        if y1 < 0.15:
-            top_edge_blocks += 1
-        if y2 > 0.85:
-            bottom_edge_blocks += 1
-        if x1 < 0.15:
-            left_edge_blocks += 1
-        if x2 > 0.85:
-            right_edge_blocks += 1
-
-    if not y_coords:
-        return {
-            "block_count": len(blocks),
-            "error": "No valid bboxes found"
-        }
-
-    stats = {
-        "block_count": len(blocks),
-        "valid_bboxes": len(y_coords),
-        "y_distribution": {
-            "min": round(min(y_coords), 4),
-            "max": round(max(y_coords), 4),
-            "mean": round(sum(y_coords) / len(y_coords), 4),
-            "median": round(sorted(y_coords)[len(y_coords) // 2], 4),
-        },
-        "x_distribution": {
-            "min": round(min(x_coords), 4),
-            "max": round(max(x_coords), 4),
-            "mean": round(sum(x_coords) / len(x_coords), 4),
-        },
-        "edge_coverage": {
-            "top_edge_blocks": top_edge_blocks,
-            "bottom_edge_blocks": bottom_edge_blocks,
-            "left_edge_blocks": left_edge_blocks,
-            "right_edge_blocks": right_edge_blocks,
-            "top_edge_pct": round((top_edge_blocks / len(y_coords)) * 100, 1) if y_coords else 0,
-            "bottom_edge_pct": round((bottom_edge_blocks / len(y_coords)) * 100, 1) if y_coords else 0,
-        },
-        "warnings": []
-    }
-
-    # Add warnings for potential issues
-    if top_edge_blocks == 0 and len(blocks) > 3:
-        stats["warnings"].append("No blocks detected in top 15% of page (potential missing header)")
-    if bottom_edge_blocks == 0 and len(blocks) > 3:
-        stats["warnings"].append("No blocks detected in bottom 15% of page (potential missing footer)")
-    if stats["y_distribution"]["min"] > 0.10:
-        stats["warnings"].append(f"First block starts at y={stats['y_distribution']['min']:.3f} (>10% from top)")
-    if stats["y_distribution"]["max"] < 0.90:
-        stats["warnings"].append(f"Last block ends before y={stats['y_distribution']['max']:.3f} (<90% down page)")
-
-    if logger:
-        logger.info("[BBOX_ANALYSIS] %d blocks | y: %.3f-%.3f | Top edge: %d (%.1f%%) | Bottom edge: %d (%.1f%%)",
-                    len(blocks),
-                    stats["y_distribution"]["min"],
-                    stats["y_distribution"]["max"],
-                    top_edge_blocks,
-                    stats["edge_coverage"]["top_edge_pct"],
-                    bottom_edge_blocks,
-                    stats["edge_coverage"]["bottom_edge_pct"])
-        for warning in stats["warnings"]:
-            logger.warning("[BBOX_ANALYSIS] %s", warning)
-
-    return stats
-
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
