@@ -188,9 +188,9 @@ INFERENCE_MODES = {
 
 INFERENCE_CONFIG = {
     "prompt": "<image>\n<|grounding|>Free OCR.",
-    "base_size": 1280,
-    "image_size": 1024,
-    "crop_mode": False,
+    "base_size": 1024,
+    "image_size": 640,
+    "crop_mode": True,
     "test_compress": False,
 }
 
