@@ -356,6 +356,10 @@ def detect_page_rotation(img: Image.Image, logger: logging.Logger) -> int:
     try:
         # Use Tesseract's OSD to detect orientation
         osd_data = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+
+        # Log full OSD data for debugging
+        logger.debug("[ROTATION] Tesseract OSD data: %s", osd_data)
+
         rotation = osd_data.get("rotate", 0)
         confidence = osd_data.get("orientation_conf", 0.0)
 
