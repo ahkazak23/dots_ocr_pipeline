@@ -1,32 +1,34 @@
-# DeepSeek-OCR Pipeline Requirements
+# DeepSeek-OCR Pipeline Requirements (Minimal)
 # For use with deepseek-ocr.py
+#
+# Installation order for Colab (CUDA 11.8):
+# 1. pip install -U pip setuptools wheel
+# 2. pip uninstall -y torch torchvision torchaudio transformers tokenizers flash-attn triton xformers || true
+# 3. pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+# 4. pip install transformers==4.46.3 tokenizers==0.20.3 einops addict easydict safetensors accelerate pillow
+# 5. pip install flash-attn==2.7.3 --no-build-isolation
+# 6. pip install -r requirements-deepseek.txt (this file)
 
-# Core dependencies
+# Core image/PDF processing
 pillow>=11.3.0
 PyMuPDF>=1.26.7
-pytesseract>=0.3.10  # For automatic page rotation detection
+pytesseract>=0.3.10
 
+# PyTorch - Install separately via --index-url (see above)
+# torch==2.6.0
+# torchvision==0.21.0
+# torchaudio==2.6.0
 
-# PyTorch (DeepSeek officially uses 2.6.0, but 2.7.0 should work)
-torch==2.7.0
-torchvision>=0.22.0
-torchaudio==2.7.0
+# Transformers & HuggingFace - Install separately with pinned versions (see above)
+# transformers==4.46.3
+# tokenizers==0.20.3
+# safetensors
+# accelerate
 
-# Transformers & HuggingFace
-transformers==4.46.3
-safetensors>=0.7.0
-huggingface-hub>=0.36.0
-tokenizers>=0.20.3
-accelerate>=1.12.0
-
-# DeepSeek-OCR specific dependencies
-addict
+# DeepSeek model dependencies (required by model architecture)
 einops
+addict
 easydict
-matplotlib
-
-# NumPy
-numpy>=2.4.0
 
 # Optional: colorama for colored terminal output
 colorama
