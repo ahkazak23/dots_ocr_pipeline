@@ -968,6 +968,52 @@ def parse_grounded_stdout(
         end = matches[i + 1].start() if i + 1 < len(matches) else len(captured)
         content = captured[start:end].strip()
 
+        # Clean up malformed content that starts with garbage followed by ref tags
+        # Example: "简陋<|/ref|>" from corrupted output like "<|ref|>table<|/ref|>简陋<|/ref|>"
+        original_content = content
+        content_had_leading_garbage = False
+
+        # Remove all leading garbage + ref tags (both opening and closing)
+        while content:
+            # Check for pattern: text followed by <|/ref|> at the start
+            # This happens when there's an extra closing tag with garbage before it
+            ref_close_match = re.match(r'^([^<]*)<\|/ref\|>', content)
+            if ref_close_match:
+                garbage_text = ref_close_match.group(1)
+                content = content[ref_close_match.end():].strip()
+                content_had_leading_garbage = True
+                continue
+
+            # Also check for opening ref tags at the start
+            if content.startswith("<|ref|>"):
+                content = content[len("<|ref|>"):].strip()
+                content_had_leading_garbage = True
+                continue
+
+            # Also check for closing ref tags at the start (without preceding text)
+            if content.startswith("<|/ref|>"):
+                content = content[len("<|/ref|>"):].strip()
+                content_had_leading_garbage = True
+                continue
+
+            # No more leading garbage found
+            break
+
+        if content_had_leading_garbage:
+            logger.warning(
+                "[MALFORMED] Block %d: Content started with garbage+ref tags. "
+                "Removed prefix '%s...' → remaining content_len=%d",
+                len(blocks), original_content[:50], len(content)
+            )
+            malformed_tags += 1
+        elif ("<|/ref|>" in content or "<|ref|>" in content) and content:
+            # Ref tags embedded in middle of content - also indicates corruption
+            logger.warning(
+                "[MALFORMED] Block %d: Content contains embedded ref tags: '%s...'",
+                len(blocks), content[:100]
+            )
+            malformed_tags += 1
+
         # Check for corrupted content
         is_corrupted = (
                 not content or
@@ -1716,10 +1762,10 @@ def _run_all_modes_experiment(
             status = "✓ SUCCESS" if success else "✗ FAILED"
             if success:
                 logger.info("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d | blocks=%d",
-                            page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count, len(mode_blocks))
+                            page_id, mode_name.ljust(30), status, infer_time, char_count, ref_tag_count, len(mode_blocks))
             else:
                 logger.warning("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d",
-                               page_id, mode_name.ljust(30), status, infer_time, char_count, ref_count)
+                               page_id, mode_name.ljust(30), status, infer_time, char_count, ref_tag_count)
 
             if success and first_success is None:
                 logger.info("[%s] First successful mode: %s", page_id, mode_name)
