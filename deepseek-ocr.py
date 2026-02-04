@@ -92,7 +92,7 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 9999  # HuggingFace: 2000, Ollama: 1280 works better
+MAX_IMAGE_DIMENSION = 2000  # Default downscale threshold; use --disable-downscale to bypass
 
 DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
 
@@ -361,8 +361,8 @@ def detect_page_rotation(img: Image.Image, logger: logging.Logger) -> int:
 
         logger.debug("[ROTATION] Detected rotation=%d° (confidence=%.1f%%)", rotation, confidence)
 
-        # Only trust high-confidence detections
-        if confidence < 1.0:
+        # Only trust high-confidence detections (15+ out of ~100)
+        if confidence < 15.0:
             logger.debug("[ROTATION] Low confidence (%.1f%%), skipping rotation", confidence)
             return 0
 
@@ -450,7 +450,7 @@ def render_pdf_to_images(
 
         # Save Step 1: Original render (after DPI scaling, before MAX_IMAGE_DIMENSION)
         if debug_save_dir:
-            step1_path = debug_save_dir / f"step1_dpi_render_{img.size[0]}x{img.size[1]}.png"
+            step1_path = debug_save_dir / f"p{page_index:04d}_step1_dpi_{img.size[0]}x{img.size[1]}.png"
             img.save(step1_path)
             logger.debug(
                 "[RENDER][P%03d] Step 1 saved: DPI render → %s",
@@ -476,7 +476,7 @@ def render_pdf_to_images(
 
             # Save Step 2: After MAX_IMAGE_DIMENSION downscaling
             if debug_save_dir:
-                step2_path = debug_save_dir / f"step2_max_dim_{img.size[0]}x{img.size[1]}.png"
+                step2_path = debug_save_dir / f"p{page_index:04d}_step2_maxdim_{img.size[0]}x{img.size[1]}.png"
                 img.save(step2_path)
                 logger.debug(
                     "[RENDER][P%03d] Step 2 saved: MAX_IMAGE_DIMENSION downscale → %s",
@@ -620,7 +620,7 @@ def classify_header_footer_heuristic(
             continue
 
         # Skip if already classified
-        if block_type in ["page-header", "page-footer"]:
+        if block_type in ["page_header", "page_footer"]:
             updated_blocks.append(block)
             continue
 
@@ -644,24 +644,24 @@ def classify_header_footer_heuristic(
         reason = None
 
         if is_bottom_region and is_small_height:
-            new_type = "page-footer"
+            new_type = "page_footer"
             reason = f"bottom region (y2={y2:.3f}) + small height (h={h:.3f})"
             footer_count += 1
         elif is_bottom_region and has_footer_pattern:
-            new_type = "page-footer"
+            new_type = "page_footer"
             reason = f"bottom region + footer pattern in text"
             footer_count += 1
         elif is_top_region and is_small_height:
-            new_type = "page-header"
+            new_type = "page_header"
             reason = f"top region (y1={y1:.3f}) + small height (h={h:.3f})"
             header_count += 1
         elif is_top_region and has_header_pattern:
-            new_type = "page-header"
+            new_type = "page_header"
             reason = f"top region + header pattern in text"
             header_count += 1
         elif has_footer_pattern and not is_top_region:
             # Page number anywhere except top
-            new_type = "page-footer"
+            new_type = "page_footer"
             reason = "footer pattern (page number/copyright)"
             footer_count += 1
 
@@ -818,7 +818,7 @@ def try_parse_html_table(html: str) -> Optional[Dict[str, Any]]:
     Parse HTML table into structured data.
     Returns {"headers": [...], "rows": [[...], ...]} or None if parsing fails.
     """
-    if not html or "<table>" not in html.lower():
+    if not html or "<table" not in html.lower():
         return None
 
     # Simple regex-based HTML table parsing
@@ -1221,17 +1221,15 @@ def _run_inference(
         tokenizer: Any,
         image_path: Path,
         infer_config: Dict[str, Any],
-        timeout_seconds: int = 600,  # Increased from 60s to prevent truncated outputs
         debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
 ) -> Tuple[str, float]:
-    """Run model inference and capture output with timeout.
+    """Run model inference and capture output (synchronous, no timeout).
 
     Args:
         model: The model instance
         tokenizer: The tokenizer instance
         image_path: Path to input image
         infer_config: Inference configuration dictionary
-        timeout_seconds: Maximum time to wait for inference
         debug_save_path: If provided, save raw model output to this file
 
     Returns:
@@ -1262,70 +1260,37 @@ def _run_inference(
     except Exception as e:
         logger.warning("[INFERENCE] Could not read input image dimensions: %s", e)
 
-    logger.debug("Inference config: %s", {k: v for k, v in config_for_infer.items() if k != "prompt"})
-    logger.debug("Timeout: %ds", timeout_seconds)
-
     res = None
     exception_msg = None
-    timeout_occurred = False
 
     # Save original stdout/stderr to restore later
     original_stdout = sys.stdout
     original_stderr = sys.stderr
 
-    def _inference_worker():
-        """Worker function to run inference in a thread."""
-        nonlocal res, exception_msg
-        try:
-            # Directly replace sys.stdout/stderr for more reliable capture
-            sys.stdout = out_buf
-            sys.stderr = err_buf
+    # Run inference directly (no threading, no timeout)
+    try:
+        # Redirect stdout/stderr to capture model output
+        sys.stdout = out_buf
+        sys.stderr = err_buf
 
-            with torch.inference_mode():
-                res = model.infer(
-                    tokenizer,
-                    prompt=prompt,
-                    image_file=str(image_path),
-                    output_path=str(image_path.parent),
-                    save_results=False,
-                    **config_for_infer,
-                )
-        except Exception as exc:
-            exception_msg = f"{type(exc).__name__}: {exc}"
-            # Restore stdout/stderr before logging
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            logger.error("Inference exception in worker: %s", exception_msg)
-        finally:
-            # Always restore stdout/stderr when worker thread exits
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-
-    # Start inference in a separate thread (non-daemon to ensure cleanup)
-    logger.debug("Starting model.infer() in background thread with %ds timeout...", timeout_seconds)
-    worker_thread = threading.Thread(target=_inference_worker, daemon=False)
-    worker_thread.start()
-
-    # Wait for completion or timeout
-    worker_thread.join(timeout=timeout_seconds)
-
-    if worker_thread.is_alive():
-        # Thread is still running - timeout occurred
-        timeout_occurred = True
-        exception_msg = f"TimeoutException: Inference exceeded {timeout_seconds}s limit"
-        logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
-        # Give thread a brief moment to write any buffered output
-        time.sleep(0.5)
-        # Note: We can't actually kill the thread, but we can stop waiting for it
-    else:
-        logger.debug("model.infer() completed within timeout")
-
-    # Ensure stdout/stderr are restored in main thread (in case of early return or timeout)
-    sys.stdout = original_stdout
-    sys.stderr = original_stderr
+        with torch.inference_mode():
+            res = model.infer(
+                tokenizer,
+                prompt=prompt,
+                image_file=str(image_path),
+                output_path=str(image_path.parent),
+                save_results=False,
+                **config_for_infer,
+            )
+    except Exception as exc:
+        exception_msg = f"{type(exc).__name__}: {exc}"
+        logger.error("Inference exception: %s", exception_msg)
+    finally:
+        # Always restore stdout/stderr
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
 
     infer_time = time.time() - t0
-    logger.debug("Inference wall time: %.2fs", infer_time)
 
     # Flush buffers to ensure all content is captured
     try:
@@ -1350,6 +1315,120 @@ def _run_inference(
     if exception_msg:
         if not captured:
             captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
+
+    # Save raw output to debug file if requested
+    if debug_save_path:
+        try:
+            debug_save_path.write_text(captured if captured else "[EMPTY OUTPUT]", encoding="utf-8")
+            logger.debug("Saved raw output to %s", debug_save_path)
+        except Exception as e:
+            logger.warning("Could not save raw output: %s", e)
+
+    return captured, infer_time
+
+
+def _run_inference_with_timeout(
+        model: Any,
+        tokenizer: Any,
+        image_path: Path,
+        infer_config: Dict[str, Any],
+        timeout_seconds: int = 600,
+        debug_save_path: Optional[Path] = None,
+) -> Tuple[str, float]:
+    """Run model inference with timeout using threading (for test_all_modes only).
+
+    Args:
+        model: The model instance
+        tokenizer: The tokenizer instance
+        image_path: Path to input image
+        infer_config: Inference configuration dictionary
+        timeout_seconds: Maximum time to wait for inference
+        debug_save_path: If provided, save raw model output to this file
+
+    Returns:
+        (captured_text, inference_time_sec)
+    """
+    logger = logging.getLogger("deepseek_ocr")
+
+    t0 = time.time()
+    out_buf = StringIO()
+    err_buf = StringIO()
+
+    prompt = infer_config.get("prompt", PROMPT)
+    config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
+
+    res = None
+    exception_msg = None
+    timeout_occurred = False
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    def _inference_worker():
+        """Worker function to run inference in a thread."""
+        nonlocal res, exception_msg
+        try:
+            sys.stdout = out_buf
+            sys.stderr = err_buf
+
+            with torch.inference_mode():
+                res = model.infer(
+                    tokenizer,
+                    prompt=prompt,
+                    image_file=str(image_path),
+                    output_path=str(image_path.parent),
+                    save_results=False,
+                    **config_for_infer,
+                )
+        except Exception as exc:
+            exception_msg = f"{type(exc).__name__}: {exc}"
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            logger.error("Inference exception in worker: %s", exception_msg)
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    # Start inference in a separate thread with timeout
+    logger.debug("Starting model.infer() with %ds timeout (test_all_modes)", timeout_seconds)
+    worker_thread = threading.Thread(target=_inference_worker, daemon=False)
+    worker_thread.start()
+    worker_thread.join(timeout=timeout_seconds)
+
+    if worker_thread.is_alive():
+        timeout_occurred = True
+        exception_msg = f"TimeoutException: Inference exceeded {timeout_seconds}s limit"
+        logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
+        time.sleep(0.5)
+
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+
+    infer_time = time.time() - t0
+
+    try:
+        out_buf.flush()
+        err_buf.flush()
+    except Exception:
+        pass
+
+    captured = ""
+    if isinstance(res, str) and res.strip():
+        captured = res.strip()
+    elif out_buf.getvalue().strip():
+        captured = out_buf.getvalue().strip()
+    elif err_buf.getvalue().strip():
+        captured = err_buf.getvalue().strip()
+
+    if exception_msg and not captured:
+        captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
+
+    if debug_save_path and captured:
+        try:
+            debug_save_path.write_text(captured, encoding="utf-8")
+            logger.debug("Saved raw output to %s", debug_save_path)
+        except Exception as e:
+            logger.warning("Could not save raw output: %s", e)
 
     return captured, infer_time
 
@@ -1564,7 +1643,7 @@ def _run_all_modes_experiment(
         try:
             logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
             t_start = time.time()
-            captured, infer_time = _run_inference(model, tokenizer, image_path, test_config, timeout_seconds=60)
+            captured, infer_time = _run_inference_with_timeout(model, tokenizer, image_path, test_config, timeout_seconds=180)
             t_end = time.time()
             total_time += infer_time
 
