@@ -40,6 +40,7 @@ from transformers import AutoModel, AutoTokenizer
 # Try to import pytesseract for rotation detection
 try:
     import pytesseract
+
     PYTESSERACT_AVAILABLE = True
 except ImportError:
     PYTESSERACT_AVAILABLE = False
@@ -255,6 +256,7 @@ class Config:
     disable_fallbacks: bool = False
     test_all_modes: bool = False  # Run all inference modes on each page
     disable_downscale: bool = False  # Disable MAX_IMAGE_DIMENSION downscaling for edge detection testing
+    store_raw_metadata: bool = False  # Store raw detection metadata (raw_label, raw_det, etc.) for debugging
 
 
 @dataclass
@@ -304,7 +306,7 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
 
 
 def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
-Tuple[Any, Any]:
+        Tuple[Any, Any]:
     if backend == Backend.OLLAMA:
         logger.info("Using Ollama backend; model is managed by Ollama daemon")
         return None, None
@@ -855,6 +857,7 @@ def parse_grounded_stdout(
         image_path: Path,
         logger: logging.Logger,
         page_id: str = "",
+        store_raw: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[int]]:
     """Parse grounded model output.
 
@@ -863,6 +866,7 @@ def parse_grounded_stdout(
         image_path: Path to the image file
         logger: Logger instance
         page_id: Page identifier for logging context
+        store_raw: If True, store raw detection metadata for debugging
 
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
@@ -970,6 +974,21 @@ def parse_grounded_stdout(
             "id": f"blk_{len(blocks) + 1}",
             "order": len(blocks),
         }
+
+        # Add raw metadata for debugging if requested
+        if store_raw:
+            try:
+                det_coords_parsed = _parse_det(det_text) if det_text else None
+            except:
+                det_coords_parsed = None
+
+            legacy_block["raw_label"] = label
+            legacy_block["raw_det"] = det_text
+            legacy_block["raw_det_parsed"] = det_coords_parsed
+            legacy_block["raw_bbox_parse_failed"] = bbox == [0.0, 0.0, 0.0, 0.0] and bool(det_text)
+            legacy_block["raw_match_index"] = i
+            legacy_block["raw_is_corrupted"] = is_corrupted
+
         blocks.append(legacy_block)
 
     parse_diag = {
@@ -1189,12 +1208,14 @@ def run_page_ocr(
         backend: Backend = Backend.HUGGINGFACE,
         test_all_modes: bool = False,
         page_dir: Optional[Path] = None,
+        store_raw: bool = False,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run OCR on a single rendered page image.
 
     Args:
         test_all_modes: If True, run all INFERENCE_MODES on this page and log timing.
         page_dir: Output directory for the page (used for saving mode outputs in test_all_modes)
+        store_raw: If True, store raw detection metadata for debugging
 
     Returns:
         (page_ocr, inference_time_sec, attempt_used, resolution)
@@ -1207,7 +1228,8 @@ def run_page_ocr(
         prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
         captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
         if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
+            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
+                                                            store_raw=store_raw)
             return page_ocr, infer_time, "ollama", resolution
         logger.warning("[%s] No grounding tags detected", page_id)
         img = Image.open(image_path).convert("RGB")
@@ -1227,7 +1249,8 @@ def run_page_ocr(
 
     if _has_grounding_tags(captured):
         logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
+        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
+                                                        store_raw=store_raw)
         return page_ocr, time_base, "base", resolution
 
     if not disable_fallbacks:
@@ -1247,7 +1270,8 @@ def run_page_ocr(
 
         if _has_grounding_tags(captured_crop):
             logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id)
+            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id,
+                                                            store_raw=store_raw)
             return page_ocr, time_base + time_crop, "crop_mode", resolution
 
         total_time = time_base + time_crop
@@ -1595,6 +1619,7 @@ def process_document(
                     backend=cfg.backend,
                     test_all_modes=cfg.test_all_modes,
                     page_dir=debug_dir,  # Pass debug_dir for any page-specific debug files
+                    store_raw=cfg.store_raw_metadata,
                 )
 
                 if cfg.save_bbox_overlay and debug_dir:
@@ -1603,7 +1628,6 @@ def process_document(
                                         debug_dir / f"page_{page_index:04d}_bbox.png")
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
-
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -1618,15 +1642,23 @@ def process_document(
                     block_type = blk.get("type", "paragraph")
                     bbox = blk.get("bbox", [0, 0, 0, 0])
 
-                    spec_blocks.append(
-                        {
-                            "type": block_type,
-                            "bbox": bbox,
-                            "extraction_origin": blk.get("extraction_origin", "deepseek-ocr"),
-                            "extraction_response": blk["extraction_response"],
-                            "extraction_response_parsed": blk["extraction_response_parsed"],
-                        }
-                    )
+                    spec_block = {
+                        "type": block_type,
+                        "bbox": bbox,
+                        "extraction_origin": blk.get("extraction_origin", "deepseek-ocr"),
+                        "extraction_response": blk["extraction_response"],
+                        "extraction_response_parsed": blk["extraction_response_parsed"],
+                    }
+
+                    # Preserve raw metadata fields if present
+                    if cfg.store_raw_metadata:
+                        for key in [
+                            "raw_label", "raw_det", "raw_det_parsed", "raw_bbox_parse_failed", "raw_match_index",
+                            "raw_is_corrupted"]:
+                            if key in blk:
+                                spec_block[key] = blk[key]
+
+                    spec_blocks.append(spec_block)
 
                 page_warnings: List[str] = []
                 if attempt_used == "none":
@@ -1901,6 +1933,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         disable_fallbacks=not args.enable_fallbacks if not args.disable_fallbacks else args.disable_fallbacks,
         test_all_modes=args.test_all_modes,
         disable_downscale=args.disable_downscale,
+        store_raw_metadata=args.raw,
     )
     ds_cfg = DeepSeekConfig(device=resolved_device, revision=args.revision)
 
@@ -2021,6 +2054,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Elapsed wall time: %.2fs (model load included)", run_total_time)
     return 0
 
+
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
     sys.exit(main())
+
