@@ -40,7 +40,6 @@ from transformers import AutoModel, AutoTokenizer
 # Try to import pytesseract for rotation detection
 try:
     import pytesseract
-
     PYTESSERACT_AVAILABLE = True
 except ImportError:
     PYTESSERACT_AVAILABLE = False
@@ -306,7 +305,7 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
 
 
 def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
-        Tuple[Any, Any]:
+Tuple[Any, Any]:
     if backend == Backend.OLLAMA:
         logger.info("Using Ollama backend; model is managed by Ollama daemon")
         return None, None
@@ -1228,8 +1227,7 @@ def run_page_ocr(
         prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
         captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
         if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
-                                                            store_raw=store_raw)
+            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id, store_raw=store_raw)
             return page_ocr, infer_time, "ollama", resolution
         logger.warning("[%s] No grounding tags detected", page_id)
         img = Image.open(image_path).convert("RGB")
@@ -1249,8 +1247,7 @@ def run_page_ocr(
 
     if _has_grounding_tags(captured):
         logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
-                                                        store_raw=store_raw)
+        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id, store_raw=store_raw)
         return page_ocr, time_base, "base", resolution
 
     if not disable_fallbacks:
@@ -1270,8 +1267,7 @@ def run_page_ocr(
 
         if _has_grounding_tags(captured_crop):
             logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id,
-                                                            store_raw=store_raw)
+            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id, store_raw=store_raw)
             return page_ocr, time_base + time_crop, "crop_mode", resolution
 
         total_time = time_base + time_crop
@@ -1629,6 +1625,7 @@ def process_document(
                     except Exception as exc:
                         logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
+
                 document_id = input_path.stem
                 page_id_str = str(page_index)
 
@@ -1652,9 +1649,7 @@ def process_document(
 
                     # Preserve raw metadata fields if present
                     if cfg.store_raw_metadata:
-                        for key in [
-                            "raw_label", "raw_det", "raw_det_parsed", "raw_bbox_parse_failed", "raw_match_index",
-                            "raw_is_corrupted"]:
+                        for key in ["raw_label", "raw_det", "raw_det_parsed", "raw_bbox_parse_failed", "raw_match_index", "raw_is_corrupted"]:
                             if key in blk:
                                 spec_block[key] = blk[key]
 
@@ -1891,6 +1886,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=False,
         help="Disable MAX_IMAGE_DIMENSION downscaling (keeps full resolution for edge detection testing)",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        default=False,
+        help="Store raw detection metadata (raw_label, raw_det, etc.) for debugging bbox parsing issues",
+    )
     return parser.parse_args(argv)
 
 
@@ -2053,7 +2054,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Run summary saved to %s", summary_path)
     logger.info("Elapsed wall time: %.2fs (model load included)", run_total_time)
     return 0
-
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
