@@ -190,7 +190,7 @@ INFERENCE_CONFIG = {
     "prompt": "<image>\n<|grounding|>Free OCR.",
     "base_size": 1280,
     "image_size": 1024,
-    "crop_mode": True,
+    "crop_mode": False,
     "test_compress": False,
 }
 
