@@ -2252,7 +2252,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Path to a PDF, image, or folder of files")
     parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
     parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
-    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
+    parser.add_argument("--device", default="cuda", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
     parser.add_argument("--revision", default=None, help="Optional model revision")
     parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
     parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
