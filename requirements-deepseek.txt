@@ -9,7 +9,7 @@ pytesseract>=0.3.10  # For automatic page rotation detection
 
 # PyTorch (DeepSeek officially uses 2.6.0, but 2.7.0 should work)
 torch==2.7.0
-torchvision>=0.21.0
+torchvision>=0.22.0
 torchaudio==2.7.0
 
 # Transformers & HuggingFace
