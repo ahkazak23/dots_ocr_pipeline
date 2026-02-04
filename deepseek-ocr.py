@@ -102,9 +102,11 @@ PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 INFERENCE_MODES = {
     "extract_all": {
         "prompt": "<image>\n<|grounding|>Free OCR.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
+        "base_size": 1280,
+        "image_size": 1024,
+        "crop_mode": True,
+        "min_crops": 2,
+        "max_crops": 6,
     },
     "document": {
         "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
@@ -187,6 +189,7 @@ INFERENCE_MODES = {
 }
 
 INFERENCE_CONFIG = {
+    "prompt": "<image>\n<|grounding|>Free OCR.",
     "base_size": 1280,
     "image_size": 1024,
     "crop_mode": True,
@@ -1879,9 +1882,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Backend: huggingface or ollama")
     parser.add_argument(
         "--mode",
-        default="extract_all",
-        choices=list(INFERENCE_MODES.keys()),
-        help="Inference mode with optimized settings (extract_all is default)",
+        default=None,
+        choices=list(INFERENCE_MODES.keys()) + [None],
+        help="Inference mode with optimized settings (default: uses INFERENCE_CONFIG)",
     )
     parser.add_argument(
         "--prompt",
@@ -1977,13 +1980,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     model, tokenizer = build_model(cfg.model, resolved_device, ds_cfg.revision, logger, backend=backend)
 
-    inference_config = INFERENCE_MODES.get(args.mode, INFERENCE_MODES["extract_all"]).copy()
+    # Start with INFERENCE_CONFIG as the base default
+    inference_config = INFERENCE_CONFIG.copy()
+
+    # Merge mode-specific settings if a mode is specified
+    if args.mode and args.mode in INFERENCE_MODES:
+        mode_config = INFERENCE_MODES[args.mode]
+        inference_config.update(mode_config)
+        logger.info("Mode: %s (merging mode-specific settings)", args.mode)
 
     if args.prompt is not None:
         inference_config["prompt"] = args.prompt
         logger.info("Prompt: custom (--prompt)")
     else:
-        logger.info("Prompt: mode default (%s)", args.mode)
+        prompt_source = f"mode default ({args.mode})" if args.mode in INFERENCE_MODES else "default"
+        logger.info("Prompt: %s", prompt_source)
 
     if args.test_compress:
         inference_config["test_compress"] = True
