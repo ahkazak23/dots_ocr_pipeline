@@ -340,50 +340,68 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
 
     # Check for flash attention availability on Ampere+ GPUs
     use_flash_attn = False
+    flash_attn_working = False
     if device == "cuda" and gpu_major is not None and gpu_major >= 8:
         try:
+            # Try importing flash_attn to check if it's working
             import flash_attn
+            from flash_attn.flash_attn_interface import flash_attn_func
+            flash_attn_working = True
             use_flash_attn = True
-            logger.info("Using FlashAttention-2 (installed + Ampere+ GPU detected)")
-        except ImportError:
-            logger.warning("Ampere+ GPU detected but flash_attn not installed; using default attention")
-            logger.warning("For faster inference, install: pip install flash-attn --no-build-isolation")
+            logger.info("FlashAttention-2 detected and working")
+        except (ImportError, OSError, AttributeError) as e:
+            # Flash attention not available or broken
+            if "ImportError" in str(type(e).__name__) and "flash_attn" not in str(e).lower():
+                logger.warning(f"Flash attention installed but has import errors: {e}")
+                logger.warning("Will use eager attention. To fix: pip uninstall flash-attn && pip install flash-attn --no-build-isolation")
+            elif "flash_attn" not in str(e).lower():
+                logger.warning(f"Flash attention check failed: {e}")
+            else:
+                logger.info("Flash attention not installed; using eager attention")
+                logger.info("For faster inference (optional): pip install flash-attn --no-build-isolation")
+            # Disable flash attention to prevent errors during model loading
+            use_flash_attn = False
+            flash_attn_working = False
 
+    # Prepare model loading kwargs (following official DeepSeek-OCR example)
     tokenizer_kwargs = {"trust_remote_code": True}
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "use_safetensors": True,
-        "torch_dtype": torch_dtype,
+        # NOTE: Do NOT set torch_dtype or device_map here, as per official example
+        # We'll handle dtype/device after loading with .eval().cuda().to(dtype)
     }
     if revision:
         tokenizer_kwargs["revision"] = revision
         model_kwargs["revision"] = revision
 
-    # Add flash attention if available
-    if use_flash_attn:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
-
-    # Set device_map for initial loading
-    if device == "cuda":
-        model_kwargs["device_map"] = {"": 0}
-    elif device == "mps":
-        model_kwargs["device_map"] = "mps"
+    # Set attention implementation (use _attn_implementation with underscore, as per official example)
+    if use_flash_attn and flash_attn_working:
+        model_kwargs["_attn_implementation"] = "flash_attention_2"
+        logger.info("Will use FlashAttention-2 for model")
     else:
-        model_kwargs["device_map"] = "cpu"
+        # Force eager attention to prevent flash_attn import errors
+        model_kwargs["_attn_implementation"] = "eager"
+        logger.info("Will use eager attention (standard PyTorch)")
 
+    # Load model (following official example: no device_map, no torch_dtype in from_pretrained)
     tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
+    logger.info("Tokenizer loaded, loading model (this may take a minute)...")
     model = AutoModel.from_pretrained(model_name, **model_kwargs)
 
-    # Explicit eval + device move + dtype cast (Colab style)
+    # Apply eval + device + dtype explicitly (official DeepSeek-OCR pattern)
     model = model.eval()
     if device == "cuda":
-        model = model.to("cuda").to(torch_dtype)
-        logger.info(f"Model explicitly moved to CUDA and cast to {torch_dtype}")
+        model = model.cuda().to(torch_dtype)
+        logger.info(f"Model loaded: eval().cuda().to({torch_dtype})")
     elif device == "mps":
         model = model.to("mps").to(torch_dtype)
-        logger.info(f"Model explicitly moved to MPS and cast to {torch_dtype}")
+        logger.info(f"Model loaded: eval().to('mps').to({torch_dtype})")
+    else:
+        model = model.to(torch_dtype)
+        logger.info(f"Model loaded: eval().to({torch_dtype})")
 
-    logger.info("Model loaded")
+    logger.info("Model ready for inference")
     return model, tokenizer
 
 
