@@ -28,7 +28,6 @@ import urllib.request
 import urllib.error
 import threading
 from dataclasses import dataclass
-from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1340,7 +1339,10 @@ def _run_inference(
         infer_config: Dict[str, Any],
         debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
 ) -> Tuple[str, float]:
-    """Run model inference and capture output (synchronous, no timeout).
+    """Run model inference using only the return value from model.infer().
+
+    Matches the official Colab behavior: call model.infer() with save_results=True
+    and trust the return value as the single source of truth.
 
     Args:
         model: The model instance
@@ -1350,14 +1352,11 @@ def _run_inference(
         debug_save_path: If provided, save raw model output to this file
 
     Returns:
-        (captured_text, inference_time_sec)
+        (result_text, inference_time_sec)
     """
     logger = logging.getLogger("deepseek_ocr")
 
     t0 = time.time()
-    # Create fresh StringIO buffers for this inference
-    out_buf = StringIO()
-    err_buf = StringIO()
 
     prompt = infer_config.get("prompt", PROMPT)
     config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
@@ -1380,68 +1379,54 @@ def _run_inference(
     res = None
     exception_msg = None
 
-    # Save original stdout/stderr to restore later
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
-    # Run inference directly (no threading, no timeout)
+    # Run inference (official Colab pattern: save_results=True, trust return value)
     try:
-        # Redirect stdout/stderr to capture model output
-        sys.stdout = out_buf
-        sys.stderr = err_buf
-
         with torch.inference_mode():
             res = model.infer(
                 tokenizer,
                 prompt=prompt,
                 image_file=str(image_path),
                 output_path=str(image_path.parent),
-                save_results=False,
+                save_results=True,  # Always save results as per official example
                 **config_for_infer,
             )
     except Exception as exc:
         exception_msg = f"{type(exc).__name__}: {exc}"
         logger.error("Inference exception: %s", exception_msg)
-    finally:
-        # Always restore stdout/stderr
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
 
     infer_time = time.time() - t0
 
-    # Flush buffers to ensure all content is captured
-    try:
-        out_buf.flush()
-        err_buf.flush()
-    except Exception:
-        pass
-
-    captured = ""
-    if isinstance(res, str) and res.strip():
-        captured = res.strip()
-        logger.debug("Captured from return value: %d chars", len(captured))
-    elif out_buf.getvalue().strip():
-        captured = out_buf.getvalue().strip()
-        logger.debug("Captured from stdout: %d chars", len(captured))
-    elif err_buf.getvalue().strip():
-        captured = err_buf.getvalue().strip()
-        logger.debug("Captured from stderr: %d chars", len(captured))
-    else:
-        logger.debug("No output captured")
-
+    # Process result: trust res as single source of truth
+    result_text = ""
     if exception_msg:
-        if not captured:
-            captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
+        logger.error("Inference failed: %s", exception_msg)
+        result_text = f"[INFERENCE_EXCEPTION] {exception_msg}"
+    elif res is None:
+        logger.warning("Inference returned None (no result)")
+        result_text = ""
+    elif isinstance(res, str):
+        result_text = res.strip()
+        logger.debug("Inference returned string: %d chars", len(result_text))
+    elif isinstance(res, dict):
+        # If model returns a dict, try to extract text from common keys
+        result_text = res.get("text", res.get("response", res.get("output", "")))
+        if not result_text:
+            logger.warning("Inference returned dict but no text found in common keys: %s", list(res.keys()))
+        else:
+            logger.debug("Inference returned dict with text: %d chars", len(result_text))
+    else:
+        logger.warning("Inference returned unexpected type: %s", type(res).__name__)
+        result_text = str(res) if res else ""
 
     # Save raw output to debug file if requested
-    if debug_save_path:
+    if debug_save_path and result_text:
         try:
-            debug_save_path.write_text(captured if captured else "[EMPTY OUTPUT]", encoding="utf-8")
+            debug_save_path.write_text(result_text, encoding="utf-8")
             logger.debug("Saved raw output to %s", debug_save_path)
         except Exception as e:
             logger.warning("Could not save raw output: %s", e)
 
-    return captured, infer_time
+    return result_text, infer_time
 
 
 def _run_inference_with_timeout(
@@ -1454,6 +1439,9 @@ def _run_inference_with_timeout(
 ) -> Tuple[str, float]:
     """Run model inference with timeout using threading (for test_all_modes only).
 
+    Matches the official Colab behavior: call model.infer() with save_results=True
+    and trust the return value as the single source of truth.
+
     Args:
         model: The model instance
         tokenizer: The tokenizer instance
@@ -1463,13 +1451,11 @@ def _run_inference_with_timeout(
         debug_save_path: If provided, save raw model output to this file
 
     Returns:
-        (captured_text, inference_time_sec)
+        (result_text, inference_time_sec)
     """
     logger = logging.getLogger("deepseek_ocr")
 
     t0 = time.time()
-    out_buf = StringIO()
-    err_buf = StringIO()
 
     prompt = infer_config.get("prompt", PROMPT)
     config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
@@ -1478,33 +1464,22 @@ def _run_inference_with_timeout(
     exception_msg = None
     timeout_occurred = False
 
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
     def _inference_worker():
         """Worker function to run inference in a thread."""
         nonlocal res, exception_msg
         try:
-            sys.stdout = out_buf
-            sys.stderr = err_buf
-
             with torch.inference_mode():
                 res = model.infer(
                     tokenizer,
                     prompt=prompt,
                     image_file=str(image_path),
                     output_path=str(image_path.parent),
-                    save_results=False,
+                    save_results=True,  # Always save results as per official example
                     **config_for_infer,
                 )
         except Exception as exc:
             exception_msg = f"{type(exc).__name__}: {exc}"
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
             logger.error("Inference exception in worker: %s", exception_msg)
-        finally:
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
 
     # Start inference in a separate thread with timeout
     logger.debug("Starting model.infer() with %ds timeout (test_all_modes)", timeout_seconds)
@@ -1518,36 +1493,42 @@ def _run_inference_with_timeout(
         logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
         time.sleep(0.5)
 
-    sys.stdout = original_stdout
-    sys.stderr = original_stderr
-
     infer_time = time.time() - t0
 
-    try:
-        out_buf.flush()
-        err_buf.flush()
-    except Exception:
-        pass
+    # Process result: trust res as single source of truth
+    result_text = ""
+    if timeout_occurred:
+        logger.error("Inference timed out after %ds", timeout_seconds)
+        result_text = f"[INFERENCE_TIMEOUT] Exceeded {timeout_seconds}s limit"
+    elif exception_msg:
+        logger.error("Inference failed: %s", exception_msg)
+        result_text = f"[INFERENCE_EXCEPTION] {exception_msg}"
+    elif res is None:
+        logger.warning("Inference returned None (no result)")
+        result_text = ""
+    elif isinstance(res, str):
+        result_text = res.strip()
+        logger.debug("Inference returned string: %d chars", len(result_text))
+    elif isinstance(res, dict):
+        # If model returns a dict, try to extract text from common keys
+        result_text = res.get("text", res.get("response", res.get("output", "")))
+        if not result_text:
+            logger.warning("Inference returned dict but no text found in common keys: %s", list(res.keys()))
+        else:
+            logger.debug("Inference returned dict with text: %d chars", len(result_text))
+    else:
+        logger.warning("Inference returned unexpected type: %s", type(res).__name__)
+        result_text = str(res) if res else ""
 
-    captured = ""
-    if isinstance(res, str) and res.strip():
-        captured = res.strip()
-    elif out_buf.getvalue().strip():
-        captured = out_buf.getvalue().strip()
-    elif err_buf.getvalue().strip():
-        captured = err_buf.getvalue().strip()
-
-    if exception_msg and not captured:
-        captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
-
-    if debug_save_path and captured:
+    # Save raw output to debug file if requested
+    if debug_save_path and result_text:
         try:
-            debug_save_path.write_text(captured, encoding="utf-8")
+            debug_save_path.write_text(result_text, encoding="utf-8")
             logger.debug("Saved raw output to %s", debug_save_path)
         except Exception as e:
             logger.warning("Could not save raw output: %s", e)
 
-    return captured, infer_time
+    return result_text, infer_time
 
 
 def _run_ollama_inference(
