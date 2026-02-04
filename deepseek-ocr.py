@@ -81,7 +81,7 @@ LABEL_TO_TYPE = {
     "text": "text_block",
     "title": "title",
     "table": "table",
-    "table_caption": "table",
+    "table_caption": "table_caption",  # Keep separate for post-processing
     "image": "image",
     "diagram": "diagram",
     "header": "page_header",
@@ -957,7 +957,32 @@ def parse_grounded_stdout(
             table_data = try_parse_html_table(content)
             if table_data is None:
                 table_data = try_parse_markdown_table(content)
-            parsed_payload = {"data": table_data, "text": normalize_text(content)}
+            # Initialize with empty caption text - will be populated during post-processing
+            parsed_payload = {"data": table_data, "text": ""}
+        elif block_type == "table_caption":
+            # table_caption content often contains: caption text + table HTML
+            # Split them: caption is text before <table>, table HTML is the <table> part
+            caption_text = ""
+            table_html = ""
+
+            if "<table" in content.lower():
+                # Split at <table tag
+                parts = content.split("<table", 1)
+                caption_text = parts[0].strip()
+                table_html = "<table" + parts[1] if len(parts) > 1 else ""
+            else:
+                # No table HTML found, treat entire content as caption
+                caption_text = content.strip()
+
+            # Parse table data if we extracted HTML
+            table_data = try_parse_html_table(table_html) if table_html else None
+
+            # Store both caption and table data
+            parsed_payload = {
+                "data": table_data,
+                "text": normalize_text(caption_text),
+                "_has_table_html": bool(table_html)  # Flag for post-processing
+            }
         elif block_type == "image":
             parsed_payload = {"data": None, "text": ""}
         else:
@@ -991,6 +1016,115 @@ def parse_grounded_stdout(
             legacy_block["raw_is_corrupted"] = is_corrupted
 
         blocks.append(legacy_block)
+
+    # Post-process: merge table_caption with table blocks
+    # Common pattern: <table> (empty) followed by <table_caption> (has caption text + table HTML)
+    processed_blocks = []
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+
+        # Case 1: table (empty) followed by table_caption (with caption + HTML)
+        # This is the REAL DeepSeek output pattern
+        if block["type"] == "table" and i + 1 < len(blocks) and blocks[i + 1]["type"] == "table_caption":
+            table_parsed = block.get("extraction_response_parsed", {})
+            table_has_data = table_parsed.get("data") is not None
+
+            caption_block = blocks[i + 1]
+            caption_parsed = caption_block.get("extraction_response_parsed", {})
+            caption_text = caption_parsed.get("text", "")
+            caption_has_table = caption_parsed.get("_has_table_html", False)
+
+            # If table is empty but caption has table data, use caption's data
+            if caption_has_table and not table_has_data:
+                block["extraction_response_parsed"]["data"] = caption_parsed.get("data")
+                logger.debug(
+                    "[%s] Used table data from table_caption (table block was empty)",
+                    page_id or "UNKNOWN"
+                )
+
+            # Set caption text on the table block
+            if caption_text:
+                block["extraction_response_parsed"]["text"] = caption_text
+
+            # Remove the internal flag
+            if "_has_table_html" in block["extraction_response_parsed"]:
+                del block["extraction_response_parsed"]["_has_table_html"]
+
+            # Keep the table block, skip the caption block
+            processed_blocks.append(block)
+            i += 2  # Skip both table and caption
+            logger.debug(
+                "[%s] Merged table + table_caption: caption=%s, has_data=%s",
+                page_id or "UNKNOWN", caption_text[:50] if caption_text else "",
+                caption_has_table or table_has_data
+            )
+
+        # Case 2: table_caption followed by table (reverse order - less common)
+        elif block["type"] == "table_caption" and i + 1 < len(blocks) and blocks[i + 1]["type"] == "table":
+            caption_parsed = block.get("extraction_response_parsed", {})
+            caption_text = caption_parsed.get("text", "")
+            caption_has_table = caption_parsed.get("_has_table_html", False)
+
+            table_block = blocks[i + 1]
+            table_parsed = table_block.get("extraction_response_parsed", {})
+            table_has_data = table_parsed.get("data") is not None
+
+            # If caption has table data but table block is empty, use caption's data
+            if caption_has_table and not table_has_data:
+                table_block["extraction_response_parsed"]["data"] = caption_parsed.get("data")
+                logger.debug(
+                    "[%s] Used table data from table_caption (reverse order)",
+                    page_id or "UNKNOWN"
+                )
+
+            # Always set caption text
+            if caption_text:
+                table_block["extraction_response_parsed"]["text"] = caption_text
+
+            # Remove the internal flag
+            if "_has_table_html" in table_block["extraction_response_parsed"]:
+                del table_block["extraction_response_parsed"]["_has_table_html"]
+
+            # Skip the caption block, keep only the merged table
+            processed_blocks.append(table_block)
+            i += 2  # Skip both caption and table
+            logger.debug(
+                "[%s] Merged table_caption + table (reverse): caption=%s",
+                page_id or "UNKNOWN", caption_text[:50] if caption_text else ""
+            )
+
+        # Case 3: Standalone table_caption with table HTML -> convert to table
+        elif block["type"] == "table_caption":
+            caption_parsed = block.get("extraction_response_parsed", {})
+            caption_has_table = caption_parsed.get("_has_table_html", False)
+
+            if caption_has_table:
+                # Convert table_caption to table since it has table data
+                block["type"] = "table"
+                if "_has_table_html" in block["extraction_response_parsed"]:
+                    del block["extraction_response_parsed"]["_has_table_html"]
+                processed_blocks.append(block)
+                logger.debug(
+                    "[%s] Converted standalone table_caption with HTML to table: caption=%s",
+                    page_id or "UNKNOWN",
+                    caption_parsed.get("text", "")[:50]
+                )
+            else:
+                # Standalone caption without table - skip it
+                logger.warning(
+                    "[%s] Skipped standalone table_caption without table HTML: %s",
+                    page_id or "UNKNOWN",
+                    caption_parsed.get("text", "")[:50]
+                )
+            i += 1
+
+        # For all other blocks, keep as-is
+        else:
+            processed_blocks.append(block)
+            i += 1
+
+    blocks = processed_blocks
 
     parse_diag = {
         "img_w": img_w,
