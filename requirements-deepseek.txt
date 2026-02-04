@@ -26,9 +26,9 @@ pytesseract>=0.3.10
 # accelerate
 
 # DeepSeek model dependencies (required by model architecture)
-einops
-addict
-easydict
+# einops
+# addict
+# easydict
 
 # Optional: colorama for colored terminal output
 colorama
