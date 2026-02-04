@@ -92,7 +92,7 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 2000  # Default downscale threshold; use --disable-downscale to bypass
+MAX_IMAGE_DIMENSION = 1280  # Default downscale threshold; use --disable-downscale to bypass
 
 DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Convert the document to markdown."
 
