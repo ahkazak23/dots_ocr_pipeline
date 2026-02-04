@@ -102,7 +102,7 @@ PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 INFERENCE_MODES = {
     "extract_all": {
         "prompt": "<image>\n<|grounding|>Free OCR.",
-        "base_size": 1280,
+        "base_size": 1024,
         "image_size": 1024,
         "crop_mode": True,
     },
@@ -187,7 +187,7 @@ INFERENCE_MODES = {
 }
 
 INFERENCE_CONFIG = {
-    "prompt": "<image>\n<|grounding|>Free OCR.",
+    "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
     "base_size": 1024,
     "image_size": 640,
     "crop_mode": True,
