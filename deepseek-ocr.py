@@ -105,8 +105,6 @@ INFERENCE_MODES = {
         "base_size": 1280,
         "image_size": 1024,
         "crop_mode": True,
-        "min_crops": 2,
-        "max_crops": 6,
     },
     "document": {
         "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
@@ -194,8 +192,6 @@ INFERENCE_CONFIG = {
     "image_size": 1024,
     "crop_mode": True,
     "test_compress": False,
-    "min_crops": 2,
-    "max_crops": 6,
 }
 
 
