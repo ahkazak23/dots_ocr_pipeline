@@ -94,7 +94,7 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 MAX_IMAGE_DIMENSION = 2000  # Default downscale threshold; use --disable-downscale to bypass
 
-DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Free OCR."
+DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Convert the document to markdown."
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
@@ -1891,7 +1891,27 @@ def process_document(
                 debug_save_dir=debug_transforms_dir, disable_downscale=cfg.disable_downscale
             )
         else:
-            page_image_paths = [input_path]
+            # For direct image input, apply rotation detection if enabled
+            img = Image.open(input_path).convert("RGB")
+            detected_rotation = detect_page_rotation(img, logger)
+
+            if detected_rotation > 0:
+                logger.info(
+                    "[IMAGE] Rotation correction: detected=%d° → rotating image",
+                    detected_rotation
+                )
+                img = img.rotate(-detected_rotation, expand=True, resample=Image.Resampling.BICUBIC)
+                # Save rotated image to temp directory
+                rotated_path = tmp_dir / f"{input_path.stem}_rotated{input_path.suffix}"
+                img.save(rotated_path)
+                page_image_paths = [rotated_path]
+                logger.info(
+                    "[IMAGE] Rotated image saved: %s (new size: %dx%d)",
+                    rotated_path.name, img.width, img.height
+                )
+            else:
+                page_image_paths = [input_path]
+
             selected_indices = parse_page_selection(pages, page_range, len(page_image_paths))
 
         pages_out: List[Dict[str, Any]] = []
