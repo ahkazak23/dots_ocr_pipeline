@@ -187,10 +187,12 @@ INFERENCE_MODES = {
 }
 
 INFERENCE_CONFIG = {
-    "base_size": 1024,
-    "image_size": 640,
-    "crop_mode": True,  # Enable crop mode for edge detection
+    "base_size": 1280,
+    "image_size": 1024,
+    "crop_mode": True,
     "test_compress": False,
+    "min_crops": 2,
+    "max_crops": 6,
 }
 
 
@@ -2084,4 +2086,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
     sys.exit(main())
-
