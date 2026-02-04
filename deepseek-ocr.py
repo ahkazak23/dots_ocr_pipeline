@@ -92,7 +92,7 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 1280  # Default downscale threshold; use --disable-downscale to bypass
+MAX_IMAGE_DIMENSION = 2048  # Default downscale threshold; use --disable-downscale to bypass
 
 DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Convert the document to markdown."
 
@@ -191,7 +191,7 @@ INFERENCE_CONFIG = {
     "base_size": 1024,
     "image_size": 640,
     "crop_mode": True,
-    "test_compress": False,
+    "test_compress": True,  # Match Colab default behavior
 }
 
 
@@ -256,7 +256,7 @@ class Config:
     save_bbox_overlay: bool = True
     disable_fallbacks: bool = False
     test_all_modes: bool = False  # Run all inference modes on each page
-    disable_downscale: bool = False  # Disable MAX_IMAGE_DIMENSION downscaling for edge detection testing
+    disable_downscale: bool = True  # Disable MAX_IMAGE_DIMENSION downscaling by default for better quality
     store_raw_metadata: bool = False  # Store raw detection metadata (raw_label, raw_det, etc.) for debugging
 
 
@@ -315,16 +315,55 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
     logger.info("Loading model %s on %s", model_name, device)
     logger.info("Note: first run will download ~6GB model files from HuggingFace")
 
+    # Detect GPU capabilities for flash attention and dtype selection
+    gpu_major, gpu_minor = None, None
+    if device == "cuda" and torch.cuda.is_available():
+        gpu_major, gpu_minor = torch.cuda.get_device_capability(0)
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        logger.info(f"CUDA available: {torch.cuda.get_device_name(0)} ({gpu_mem_gb:.1f} GB) - Compute Capability: SM{gpu_major}{gpu_minor}")
+
+    # Determine dtype based on GPU capability (Ampere+ = bf16, older = fp16)
+    if device == "cuda" and torch.cuda.is_available():
+        # Only use bfloat16 on Ampere+ (SM 8.0+) where it's natively supported
+        if gpu_major >= 8 and torch.cuda.is_bf16_supported():
+            torch_dtype = torch.bfloat16
+            logger.info("Using bfloat16 (Ampere+ GPU with native BF16 support)")
+        else:
+            torch_dtype = torch.float16
+            logger.info(f"Using float16 (SM{gpu_major}{gpu_minor} GPU, BF16 not natively supported)")
+    elif device == "mps":
+        torch_dtype = torch.float16
+        logger.info("Using float16 for MPS device")
+    else:
+        torch_dtype = torch.float32
+        logger.info("Using float32 for CPU")
+
+    # Check for flash attention availability on Ampere+ GPUs
+    use_flash_attn = False
+    if device == "cuda" and gpu_major is not None and gpu_major >= 8:
+        try:
+            import flash_attn
+            use_flash_attn = True
+            logger.info("Using FlashAttention-2 (installed + Ampere+ GPU detected)")
+        except ImportError:
+            logger.warning("Ampere+ GPU detected but flash_attn not installed; using default attention")
+            logger.warning("For faster inference, install: pip install flash-attn --no-build-isolation")
+
     tokenizer_kwargs = {"trust_remote_code": True}
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "use_safetensors": True,
-        "torch_dtype": torch.bfloat16 if device in ("cuda", "mps") else torch.float32,
+        "torch_dtype": torch_dtype,
     }
     if revision:
         tokenizer_kwargs["revision"] = revision
         model_kwargs["revision"] = revision
 
+    # Add flash attention if available
+    if use_flash_attn:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+
+    # Set device_map for initial loading
     if device == "cuda":
         model_kwargs["device_map"] = {"": 0}
     elif device == "mps":
@@ -333,7 +372,17 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
         model_kwargs["device_map"] = "cpu"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
-    model = AutoModel.from_pretrained(model_name, **model_kwargs).eval()
+    model = AutoModel.from_pretrained(model_name, **model_kwargs)
+
+    # Explicit eval + device move + dtype cast (Colab style)
+    model = model.eval()
+    if device == "cuda":
+        model = model.to("cuda").to(torch_dtype)
+        logger.info(f"Model explicitly moved to CUDA and cast to {torch_dtype}")
+    elif device == "mps":
+        model = model.to("mps").to(torch_dtype)
+        logger.info(f"Model explicitly moved to MPS and cast to {torch_dtype}")
+
     logger.info("Model loaded")
     return model, tokenizer
 
@@ -2262,8 +2311,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--disable-downscale",
         action="store_true",
-        default=False,
-        help="Disable MAX_IMAGE_DIMENSION downscaling (keeps full resolution for edge detection testing)",
+        default=True,
+        help="Disable MAX_IMAGE_DIMENSION downscaling (keeps full resolution, now default behavior)",
     )
     parser.add_argument(
         "--raw",
