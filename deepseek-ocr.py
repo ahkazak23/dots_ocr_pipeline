@@ -91,7 +91,7 @@ PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
 
 INFERENCE_CONFIG = {
-    "prompt": "<image>\n<|grounding|>Free OCR.",
+    "prompt": "<image>\n<|grounding|>Free OCR",
     "base_size": 1024,
     "image_size": 640,
     "crop_mode" : True,
