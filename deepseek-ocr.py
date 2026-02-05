@@ -1238,6 +1238,13 @@ def _run_inference(
 
     exception_msg = None
 
+    # Determine output path for inference artifacts
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        inference_output_path = str(debug_dir)
+    else:
+        inference_output_path = str(image_path.parent)
+
     try:
         # Redirect stdout/stderr to buffers
         sys.stdout = out_buf
@@ -1249,7 +1256,7 @@ def _run_inference(
                 tokenizer,
                 prompt=prompt,
                 image_file=str(image_path),
-                output_path=str(image_path.parent),
+                output_path=inference_output_path,
                 save_results=False,
                 **config_for_infer,
             )
