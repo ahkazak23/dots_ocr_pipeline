@@ -1240,7 +1240,6 @@ def _run_inference(
                 image_file=str(image_path),
                 output_path=str(image_path.parent),
                 save_results=True,  # Always save results as per official example
-                test_compress=True,
                 **config_for_infer,
             )
     except Exception as exc:
