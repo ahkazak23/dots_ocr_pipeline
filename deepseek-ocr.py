@@ -317,7 +317,7 @@ def detect_page_rotation(img: Image.Image, logger: logging.Logger) -> int:
         logger.debug("[ROTATION] Detected rotation=%d° (confidence=%.1f%%)", rotation, confidence)
 
         # Only trust high-confidence detections (15+ out of ~100)
-        if confidence < 10.0 and int(rotation) != 0:
+        if confidence < 5.0:
             logger.debug("[ROTATION] Low confidence (%.1f%%), skipping rotation", confidence)
             return 0
 
