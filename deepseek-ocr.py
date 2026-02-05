@@ -66,7 +66,7 @@ except ImportError:
 # Constants
 
 REF_RE = re.compile(
-    r"<\|ref\|>(?P<label>.*?)<\|/ref\|>\s*<\|det\|>(?P<det>\[.*?\])<\|/det\|>\s*",
+    r"<\|ref\|>(?P<label>.*?)<\|/ref\|>.*?<\|det\|>(?P<det>\[.*?\])<\|/det\|>\s*",
     re.DOTALL,
 )
 
