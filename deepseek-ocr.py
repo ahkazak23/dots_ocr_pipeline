@@ -1261,12 +1261,13 @@ def _run_inference(
         img = Image.open(image_path)
         img_w, img_h = img.size
         logger.info(
-            "[INFERENCE] Input: %s (%dx%d px) | Model config: base_size=%s, image_size=%s",
+            "[INFERENCE] Input: %s (%dx%d px) | Model config: base_size=%s, image_size=%s, prompt=%s",
             image_path.name,
             img_w,
             img_h,
             config_for_infer.get("base_size", "default"),
             config_for_infer.get("image_size", "default"),
+            prompt
         )
     except Exception as e:
         logger.warning("[INFERENCE] Could not read input image dimensions: %s", e)
