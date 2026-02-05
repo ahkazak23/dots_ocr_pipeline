@@ -1285,17 +1285,41 @@ def _run_inference(
 
     infer_time = time.time() - t0
 
-    # Process result: trust res as single source of truth
+    # Process result: if we captured to file, use that content; otherwise use res
     result_text = ""
+
+    if debug_dir:
+        # Read from raw_output.txt - this is the source of truth
+        raw_output_path = debug_dir / "raw_output.txt"
+        try:
+            if raw_output_path.exists():
+                result_text = raw_output_path.read_text(encoding="utf-8")
+                logger.debug("Read %d chars from raw_output.txt", len(result_text))
+            else:
+                logger.warning("raw_output.txt does not exist, falling back to res")
+                result_text = _extract_text_from_res(res, exception_msg, logger)
+        except Exception as e:
+            logger.warning("Failed to read raw_output.txt: %s, falling back to res", e)
+            result_text = _extract_text_from_res(res, exception_msg, logger)
+    else:
+        # No capture requested, use res directly
+        result_text = _extract_text_from_res(res, exception_msg, logger)
+
+    return result_text, infer_time
+
+
+def _extract_text_from_res(res: Any, exception_msg: Optional[str], logger: logging.Logger) -> str:
+    """Extract text from model inference result."""
     if exception_msg:
         logger.error("Inference failed: %s", exception_msg)
-        result_text = f"[INFERENCE_EXCEPTION] {exception_msg}"
+        return f"[INFERENCE_EXCEPTION] {exception_msg}"
     elif res is None:
         logger.warning("Inference returned None (no result)")
-        result_text = ""
+        return ""
     elif isinstance(res, str):
         result_text = res.strip()
         logger.debug("Inference returned string: %d chars", len(result_text))
+        return result_text
     elif isinstance(res, dict):
         # If model returns a dict, try to extract text from common keys
         result_text = res.get("text", res.get("response", res.get("output", "")))
@@ -1303,14 +1327,10 @@ def _run_inference(
             logger.warning("Inference returned dict but no text found in common keys: %s", list(res.keys()))
         else:
             logger.debug("Inference returned dict with text: %d chars", len(result_text))
+        return result_text
     else:
         logger.warning("Inference returned unexpected type: %s", type(res).__name__)
-        result_text = str(res) if res else ""
-
-    # Save raw output to debug file if requested
-    # (removed: debug artifacts/keep renders)
-
-    return result_text, infer_time
+        return str(res) if res else ""
 
 
 
