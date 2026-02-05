@@ -1191,6 +1191,7 @@ def _run_inference(
         tokenizer: Any,
         image_path: Path,
         infer_config: Dict[str, Any],
+        debug_dir: Optional[Path] = None,
 ) -> Tuple[str, float]:
     """Run model inference using only the return value from model.infer().
 
@@ -1202,6 +1203,7 @@ def _run_inference(
         tokenizer: The tokenizer instance
         image_path: Path to input image
         infer_config: Inference configuration dictionary
+        debug_dir: Optional directory to save raw stdout/stderr output
 
     Returns:
         (result_text, inference_time_sec)
@@ -1231,6 +1233,27 @@ def _run_inference(
     res = None
     exception_msg = None
 
+    # Set up stdout/stderr capture if debug_dir is provided
+    original_stdout = None
+    original_stderr = None
+    capture_file = None
+
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        raw_output_path = debug_dir / "raw_output.txt"
+        try:
+            capture_file = open(raw_output_path, "w", encoding="utf-8", buffering=1)
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            sys.stdout = capture_file
+            sys.stderr = capture_file
+            logger.debug("Redirecting stdout/stderr to: %s", raw_output_path)
+        except Exception as e:
+            logger.warning("Failed to set up stdout/stderr capture: %s", e)
+            if capture_file:
+                capture_file.close()
+                capture_file = None
+
     # Run inference (official Colab pattern: save_results=True, trust return value)
     try:
         with torch.inference_mode():
@@ -1244,7 +1267,21 @@ def _run_inference(
             )
     except Exception as exc:
         exception_msg = f"{type(exc).__name__}: {exc}"
+        # Log to capture file if active, otherwise to logger
+        if capture_file and not capture_file.closed:
+            import traceback
+            print(f"\n[EXCEPTION] {exception_msg}", file=capture_file, flush=True)
+            print("\nTraceback:", file=capture_file, flush=True)
+            traceback.print_exc(file=capture_file)
         logger.error("Inference exception: %s", exception_msg)
+    finally:
+        # Always restore stdout/stderr
+        if original_stdout is not None:
+            sys.stdout = original_stdout
+        if original_stderr is not None:
+            sys.stderr = original_stderr
+        if capture_file and not capture_file.closed:
+            capture_file.close()
 
     infer_time = time.time() - t0
 
@@ -1285,6 +1322,7 @@ def run_page_ocr(
         logger: logging.Logger,
         page_id: str = "",
         store_raw: bool = False,
+        debug_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run OCR on a single rendered page image.
 
@@ -1292,13 +1330,14 @@ def run_page_ocr(
 
     Args:
         store_raw: If True, store raw detection metadata for debugging
+        debug_dir: Optional directory to save raw stdout/stderr output
 
     Returns:
         (page_ocr, inference_time_sec, attempt_used, resolution)
     """
 
     logger.info("[%s] Inference", page_id)
-    captured, infer_time = _run_inference(model, tokenizer, image_path, infer_config)
+    captured, infer_time = _run_inference(model, tokenizer, image_path, infer_config, debug_dir)
 
     logger.debug("[%s] Attempt captured %d chars", page_id, len(captured))
     if captured:
@@ -1417,6 +1456,9 @@ def process_document(
             page_id = f"{input_path.stem}|P{page_index:04d}"
 
             try:
+                # Create debug directory for this page
+                page_debug_dir = selection_dir / "debug" / f"page_{page_index:04d}"
+
                 page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
                     model=model,
                     tokenizer=tokenizer,
@@ -1425,6 +1467,7 @@ def process_document(
                     logger=logger,
                     page_id=page_id,
                     store_raw=cfg.store_raw_metadata,
+                    debug_dir=page_debug_dir,
                 )
 
 
