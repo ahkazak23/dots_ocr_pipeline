@@ -21,6 +21,7 @@ import time
 import warnings
 import logging
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1193,10 +1194,7 @@ def _run_inference(
         infer_config: Dict[str, Any],
         debug_dir: Optional[Path] = None,
 ) -> Tuple[str, float]:
-    """Run model inference using only the return value from model.infer().
-
-    Matches the official Colab behavior: call model.infer() with save_results=True
-    and trust the return value as the single source of truth.
+    """Run model inference and capture stdout/stderr to buffers.
 
     Args:
         model: The model instance
@@ -1206,11 +1204,15 @@ def _run_inference(
         debug_dir: Optional directory to save raw stdout/stderr output
 
     Returns:
-        (result_text, inference_time_sec)
+        (captured_text, inference_time_sec)
     """
     logger = logging.getLogger("deepseek_ocr")
 
     t0 = time.time()
+
+    # Create StringIO buffers to capture output
+    out_buf = StringIO()
+    err_buf = StringIO()
 
     prompt = infer_config.get("prompt", PROMPT)
     config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
@@ -1230,111 +1232,66 @@ def _run_inference(
     except Exception as e:
         logger.warning("[INFERENCE] Could not read input image dimensions: %s", e)
 
-    res = None
+    # Save original stdout/stderr
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
     exception_msg = None
 
-    # Set up stdout/stderr capture if debug_dir is provided
-    original_stdout = None
-    original_stderr = None
-    capture_file = None
-
-    if debug_dir:
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        raw_output_path = debug_dir / "raw_output.txt"
-        try:
-            capture_file = open(raw_output_path, "w", encoding="utf-8", buffering=1)
-            original_stdout = sys.stdout
-            original_stderr = sys.stderr
-            sys.stdout = capture_file
-            sys.stderr = capture_file
-            logger.debug("Redirecting stdout/stderr to: %s", raw_output_path)
-        except Exception as e:
-            logger.warning("Failed to set up stdout/stderr capture: %s", e)
-            if capture_file:
-                capture_file.close()
-                capture_file = None
-
-    # Run inference (official Colab pattern: save_results=True, trust return value)
     try:
+        # Redirect stdout/stderr to buffers
+        sys.stdout = out_buf
+        sys.stderr = err_buf
+
+        # Run inference
         with torch.inference_mode():
-            res = model.infer(
+            model.infer(
                 tokenizer,
                 prompt=prompt,
                 image_file=str(image_path),
                 output_path=str(image_path.parent),
-                save_results=True,  # Always save results as per official example
+                save_results=False,
                 **config_for_infer,
             )
     except Exception as exc:
         exception_msg = f"{type(exc).__name__}: {exc}"
-        # Log to capture file if active, otherwise to logger
-        if capture_file and not capture_file.closed:
-            import traceback
-            print(f"\n[EXCEPTION] {exception_msg}", file=capture_file, flush=True)
-            print("\nTraceback:", file=capture_file, flush=True)
-            traceback.print_exc(file=capture_file)
+        # Restore stdout/stderr before logging
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
         logger.error("Inference exception: %s", exception_msg)
+        import traceback
+        traceback.print_exc()
     finally:
         # Always restore stdout/stderr
-        if original_stdout is not None:
-            sys.stdout = original_stdout
-        if original_stderr is not None:
-            sys.stderr = original_stderr
-        if capture_file and not capture_file.closed:
-            capture_file.close()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
 
     infer_time = time.time() - t0
 
-    # Process result: if we captured to file, use that content; otherwise use res
-    result_text = ""
+    # Get captured text from buffers
+    captured = ""
+    if out_buf.getvalue().strip():
+        captured = out_buf.getvalue().strip()
+        logger.debug("Captured from stdout: %d chars", len(captured))
+    elif err_buf.getvalue().strip():
+        captured = err_buf.getvalue().strip()
+        logger.debug("Captured from stderr: %d chars", len(captured))
+    else:
+        logger.warning("No output captured from buffers")
+        if exception_msg:
+            captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
 
-    if debug_dir and capture_file is not None:
-        # Read from raw_output.txt - this is the source of truth
-        raw_output_path = debug_dir / "raw_output.txt"
-        logger.info("Reading captured output from: %s", raw_output_path)
+    # Save to debug file if requested
+    if debug_dir and captured:
         try:
-            if raw_output_path.exists():
-                result_text = raw_output_path.read_text(encoding="utf-8")
-                logger.info("Successfully read %d chars from raw_output.txt", len(result_text))
-            else:
-                logger.error("raw_output.txt does not exist at: %s", raw_output_path)
-                result_text = _extract_text_from_res(res, exception_msg, logger)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            raw_output_path = debug_dir / "raw_output.txt"
+            raw_output_path.write_text(captured, encoding="utf-8")
+            logger.debug("Saved raw output to: %s", raw_output_path)
         except Exception as e:
-            logger.error("Failed to read raw_output.txt: %s, falling back to res", e)
-            result_text = _extract_text_from_res(res, exception_msg, logger)
-    else:
-        # No capture requested or capture setup failed, use res directly
-        if debug_dir:
-            logger.warning("Debug dir provided but capture was not set up, using res")
-        result_text = _extract_text_from_res(res, exception_msg, logger)
+            logger.warning("Failed to save raw output: %s", e)
 
-    return result_text, infer_time
-
-
-def _extract_text_from_res(res: Any, exception_msg: Optional[str], logger: logging.Logger) -> str:
-    """Extract text from model inference result."""
-    if exception_msg:
-        logger.error("Inference failed: %s", exception_msg)
-        return f"[INFERENCE_EXCEPTION] {exception_msg}"
-    elif res is None:
-        logger.warning("Inference returned None (no result)")
-        return ""
-    elif isinstance(res, str):
-        result_text = res.strip()
-        logger.debug("Inference returned string: %d chars", len(result_text))
-        return result_text
-    elif isinstance(res, dict):
-        # If model returns a dict, try to extract text from common keys
-        result_text = res.get("text", res.get("response", res.get("output", "")))
-        if not result_text:
-            logger.warning("Inference returned dict but no text found in common keys: %s", list(res.keys()))
-        else:
-            logger.debug("Inference returned dict with text: %d chars", len(result_text))
-        return result_text
-    else:
-        logger.warning("Inference returned unexpected type: %s", type(res).__name__)
-        return str(res) if res else ""
-
+    return captured, infer_time
 
 
 def run_page_ocr(
