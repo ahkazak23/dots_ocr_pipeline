@@ -1288,21 +1288,24 @@ def _run_inference(
     # Process result: if we captured to file, use that content; otherwise use res
     result_text = ""
 
-    if debug_dir:
+    if debug_dir and capture_file is not None:
         # Read from raw_output.txt - this is the source of truth
         raw_output_path = debug_dir / "raw_output.txt"
+        logger.info("Reading captured output from: %s", raw_output_path)
         try:
             if raw_output_path.exists():
                 result_text = raw_output_path.read_text(encoding="utf-8")
-                logger.debug("Read %d chars from raw_output.txt", len(result_text))
+                logger.info("Successfully read %d chars from raw_output.txt", len(result_text))
             else:
-                logger.warning("raw_output.txt does not exist, falling back to res")
+                logger.error("raw_output.txt does not exist at: %s", raw_output_path)
                 result_text = _extract_text_from_res(res, exception_msg, logger)
         except Exception as e:
-            logger.warning("Failed to read raw_output.txt: %s, falling back to res", e)
+            logger.error("Failed to read raw_output.txt: %s, falling back to res", e)
             result_text = _extract_text_from_res(res, exception_msg, logger)
     else:
-        # No capture requested, use res directly
+        # No capture requested or capture setup failed, use res directly
+        if debug_dir:
+            logger.warning("Debug dir provided but capture was not set up, using res")
         result_text = _extract_text_from_res(res, exception_msg, logger)
 
     return result_text, infer_time
