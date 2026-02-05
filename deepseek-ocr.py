@@ -3,11 +3,9 @@
 DeepSeek-OCR pipeline: extract structured text/tables from PDFs and images.
 
 Processes documents page-by-page using DeepSeek-OCR with grounded bounding boxes.
-Uses 2-attempt fallback: base inference, then optional crop_mode if extraction fails.
+Runs single-pass inference (no crop_mode fallback).
 Outputs per-page spec-compliant JSON (page_<N>.json), optional legacy document.json,
 and run summary with per-page timing in evaluation_output/.
-
-Supports HuggingFace and Ollama backends.
 """
 
 from __future__ import annotations
@@ -22,11 +20,6 @@ import tempfile
 import time
 import warnings
 import logging
-import enum
-import base64
-import urllib.request
-import urllib.error
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -91,105 +84,15 @@ LABEL_TO_TYPE = {
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MAX_IMAGE_DIMENSION = 2048  # Default downscale threshold; use --disable-downscale to bypass
-
 DEFAULT_PROMPT_EXTRACT_ALL = "<image>\n<|grounding|>Convert the document to markdown."
 
 PROMPT = DEFAULT_PROMPT_EXTRACT_ALL
 
-# Mode-specific inference configurations
-INFERENCE_MODES = {
-    "extract_all": {
-        "prompt": "<image>\n<|grounding|>Free OCR.",
-        "base_size": 1024,
-        "image_size": 1024,
-        "crop_mode": True,
-    },
-    "document": {
-        "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "chart": {
-        "prompt": "<image>\n<|grounding|>Parse all charts and tables.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "dense_text": {
-        "prompt": "<image>\n<|grounding|>Free OCR.",
-        "base_size": 768,
-        "image_size": 512,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "high_detail": {
-        "prompt": "<image>\n<|grounding|>Extract complete document.",
-        "base_size": 1024,
-        "image_size": 768,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "multilingual": {
-        "prompt": "<image>\n<|grounding|>Extract text.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_tiny": {
-        "prompt": "<image>\n<|grounding|>Convert to markdown.",
-        "base_size": 512,
-        "image_size": 384,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_large": {
-        "prompt": "<image>\n<|grounding|>Convert to markdown.",
-        "base_size": 1280,
-        "image_size": 896,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_simple_prompt": {
-        "prompt": "<image>\n<|grounding|>Extract all text.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_detailed_prompt": {
-        "prompt": "<image>\n<|grounding|>Extract all content.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_base_768_img_640": {
-        "prompt": "<image>\n<|grounding|>Convert to markdown.",
-        "base_size": 768,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_base_1024_img_512": {
-        "prompt": "<image>\n<|grounding|>Convert to markdown.",
-        "base_size": 1024,
-        "image_size": 512,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "experimental_base_896_img_768": {
-        "prompt": "<image>\n<|grounding|>Convert to markdown.",
-        "base_size": 896,
-        "image_size": 768,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-    "layout_first": {
-        "prompt": "<image>\n<|grounding|>Detect layout.",
-        "base_size": 1024,
-        "image_size": 640,
-        "crop_mode": True,  # Enable crop mode for edge detection
-    },
-}
 
 INFERENCE_CONFIG = {
     "prompt": "<image>\n<|grounding|>Convert the document to markdown.",
     "base_size": 1024,
     "image_size": 640,
-    "crop_mode": True,
     "test_compress": True,  # Match Colab default behavior
 }
 
@@ -233,29 +136,16 @@ def _setup_logger(log_level: str = "INFO") -> logging.Logger:
     return logger
 
 
-# Backend
-
-class Backend(str, enum.Enum):
-    HUGGINGFACE = "huggingface"
-    OLLAMA = "ollama"
-
-
 # Config
 
 @dataclass
 class Config:
     """Configuration for DeepSeek-OCR pipeline."""
     model: str = "deepseek-ai/DeepSeek-OCR"
-    backend: Backend = Backend.HUGGINGFACE
     dpi: int = 200
     out_dir: str = "./out_json/deepseek_ocr"
     eval_out_dir: str = "./evaluation_output"
     log_level: str = "INFO"
-    debug_keep_renders: bool = True
-    save_bbox_overlay: bool = True
-    disable_fallbacks: bool = False
-    test_all_modes: bool = False  # Run all inference modes on each page
-    disable_downscale: bool = True  # Disable MAX_IMAGE_DIMENSION downscaling by default for better quality
     store_raw_metadata: bool = False  # Store raw detection metadata (raw_label, raw_det, etc.) for debugging
 
 
@@ -263,7 +153,6 @@ class Config:
 class DeepSeekConfig:
     """Configuration for DeepSeek model loading."""
     device: str = "auto"
-    revision: Optional[str] = None
 
 
 def is_pdf(path: Path) -> bool:
@@ -305,11 +194,8 @@ def resolve_device(device_arg: str, logger: logging.Logger) -> Tuple[str, str]:
     return "cpu", "cpu"
 
 
-def build_model(model_name: str, device: str, revision: Optional[str], logger: logging.Logger, backend: Backend) -> \
+def build_model(model_name: str, device: str, logger: logging.Logger) -> \
         Tuple[Any, Any]:
-    if backend == Backend.OLLAMA:
-        logger.info("Using Ollama backend; model is managed by Ollama daemon")
-        return None, None
 
     logger.info("Loading model %s on %s", model_name, device)
     logger.info("Note: first run will download ~6GB model files from HuggingFace")
@@ -370,9 +256,6 @@ def build_model(model_name: str, device: str, revision: Optional[str], logger: l
         # NOTE: Do NOT set torch_dtype or device_map here, as per official example
         # We'll handle dtype/device after loading with .eval().cuda().to(dtype)
     }
-    if revision:
-        tokenizer_kwargs["revision"] = revision
-        model_kwargs["revision"] = revision
 
     # Set attention implementation (use _attn_implementation with underscore, as per official example)
     if use_flash_attn and flash_attn_working:
@@ -448,8 +331,6 @@ def render_pdf_to_images(
         tmp_dir: Path,
         logger: logging.Logger,
         page_indices: Optional[List[int]] = None,
-        debug_save_dir: Optional[Path] = None,
-        disable_downscale: bool = False,
 ) -> List[Path]:
     """Render selected PDF pages to images.
 
@@ -458,8 +339,6 @@ def render_pdf_to_images(
         dpi: Render DPI.
         tmp_dir: Output directory for rendered page images.
         page_indices: Optional list of 0-based page indices to render.
-        debug_save_dir: If provided, save intermediate transformation images here.
-        disable_downscale: If True, skip MAX_IMAGE_DIMENSION downscaling.
 
     Returns:
         List of rendered image paths.
@@ -518,41 +397,7 @@ def render_pdf_to_images(
                 img.size[1]
             )
 
-        # Save Step 1: Original render (after DPI scaling, before MAX_IMAGE_DIMENSION)
-        if debug_save_dir:
-            step1_path = debug_save_dir / f"p{page_index:04d}_step1_dpi_{img.size[0]}x{img.size[1]}.png"
-            img.save(step1_path)
-            logger.debug(
-                "[RENDER][P%03d] Step 1 saved: DPI render → %s",
-                page_index + 1,
-                step1_path.name
-            )
-
-        if max(img.size) > MAX_IMAGE_DIMENSION and not disable_downscale:
-            original_size = img.size
-            scale = MAX_IMAGE_DIMENSION / max(img.size)
-            new_size = (int(img.width * scale), int(img.height * scale))
-            resample = getattr(Image, "LANCZOS", None) or getattr(Image.Resampling, "LANCZOS", 1)
-            img = img.resize(new_size, resample)
-            was_downscaled = True
-            logger.info(
-                "[RENDER][P%03d] Step 2: Downscaled %s → %s (%.1f%% scale, max_dim=%d)",
-                page_index + 1,
-                original_size,
-                new_size,
-                (new_size[0] / original_size[0]) * 100,
-                MAX_IMAGE_DIMENSION,
-            )
-
-            # Save Step 2: After MAX_IMAGE_DIMENSION downscaling
-            if debug_save_dir:
-                step2_path = debug_save_dir / f"p{page_index:04d}_step2_maxdim_{img.size[0]}x{img.size[1]}.png"
-                img.save(step2_path)
-                logger.debug(
-                    "[RENDER][P%03d] Step 2 saved: MAX_IMAGE_DIMENSION downscale → %s",
-                    page_index + 1,
-                    step2_path.name
-                )
+        # Downscaling permanently disabled - images kept at full DPI resolution for better quality
 
         img_path = tmp_dir / f"page_{page_index}.png"
         img.save(img_path)
@@ -992,12 +837,23 @@ def parse_grounded_stdout(
     Returns:
         (legacy_page_ocr, parse_diagnostics, resolution)
     """
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(image_path)
+    # Keep PDF-rendered images behavior stable (rendered PNGs normalized to RGB).
+    # For user-provided images, preserve original mode (no forced RGB conversion).
+    if image_path.suffix.lower() == ".png" and image_path.name.startswith("page_") and img.mode != "RGB":
+        img = img.convert("RGB")
+
     img_w, img_h = img.size
     resolution = [img_w, img_h]
 
-    logger.debug("[%s] Parsing grounded output: image=%s (%dx%d), captured_len=%d",
-                 page_id or "UNKNOWN", image_path.name, img_w, img_h, len(captured))
+    logger.debug(
+        "[%s] Parsing grounded output: image=%s (%dx%d), captured_len=%d",
+        page_id or "UNKNOWN",
+        image_path.name,
+        img_w,
+        img_h,
+        len(captured),
+    )
 
     matches = list(REF_RE.finditer(captured))
     blocks: List[Dict[str, Any]] = []
@@ -1150,14 +1006,12 @@ def parse_grounded_stdout(
             parsed_payload = {"data": None, "text": normalize_text(content)}
 
         # Build block matching OmniDocBench format
-        # Keep id/order for backward compatibility with bbox overlay tools
         legacy_block = {
             "type": block_type,
             "bbox": bbox,
             "extraction_origin": "deepseek-ocr",
             "extraction_response": content,
             "extraction_response_parsed": parsed_payload,
-            # Legacy fields for bbox overlay compatibility
             "id": f"blk_{len(blocks) + 1}",
             "order": len(blocks),
         }
@@ -1321,7 +1175,7 @@ def parse_grounded_stdout(
         "malformed_tags": malformed_tags,
     }
 
-    # Return legacy format for bbox overlay, diagnostics, and resolution
+    # Return legacy format, diagnostics, and resolution
     return {"ocr": {"blocks": blocks}}, parse_diag, resolution
 
 
@@ -1337,7 +1191,6 @@ def _run_inference(
         tokenizer: Any,
         image_path: Path,
         infer_config: Dict[str, Any],
-        debug_save_path: Optional[Path] = None,  # Path to save raw output for debugging
 ) -> Tuple[str, float]:
     """Run model inference using only the return value from model.infer().
 
@@ -1349,7 +1202,6 @@ def _run_inference(
         tokenizer: The tokenizer instance
         image_path: Path to input image
         infer_config: Inference configuration dictionary
-        debug_save_path: If provided, save raw model output to this file
 
     Returns:
         (result_text, inference_time_sec)
@@ -1388,6 +1240,7 @@ def _run_inference(
                 image_file=str(image_path),
                 output_path=str(image_path.parent),
                 save_results=True,  # Always save results as per official example
+                test_compress=True,
                 **config_for_infer,
             )
     except Exception as exc:
@@ -1419,164 +1272,10 @@ def _run_inference(
         result_text = str(res) if res else ""
 
     # Save raw output to debug file if requested
-    if debug_save_path and result_text:
-        try:
-            debug_save_path.write_text(result_text, encoding="utf-8")
-            logger.debug("Saved raw output to %s", debug_save_path)
-        except Exception as e:
-            logger.warning("Could not save raw output: %s", e)
+    # (removed: debug artifacts/keep renders)
 
     return result_text, infer_time
 
-
-def _run_inference_with_timeout(
-        model: Any,
-        tokenizer: Any,
-        image_path: Path,
-        infer_config: Dict[str, Any],
-        timeout_seconds: int = 600,
-        debug_save_path: Optional[Path] = None,
-) -> Tuple[str, float]:
-    """Run model inference with timeout using threading (for test_all_modes only).
-
-    Matches the official Colab behavior: call model.infer() with save_results=True
-    and trust the return value as the single source of truth.
-
-    Args:
-        model: The model instance
-        tokenizer: The tokenizer instance
-        image_path: Path to input image
-        infer_config: Inference configuration dictionary
-        timeout_seconds: Maximum time to wait for inference
-        debug_save_path: If provided, save raw model output to this file
-
-    Returns:
-        (result_text, inference_time_sec)
-    """
-    logger = logging.getLogger("deepseek_ocr")
-
-    t0 = time.time()
-
-    prompt = infer_config.get("prompt", PROMPT)
-    config_for_infer = {k: v for k, v in infer_config.items() if k != "prompt"}
-
-    res = None
-    exception_msg = None
-    timeout_occurred = False
-
-    def _inference_worker():
-        """Worker function to run inference in a thread."""
-        nonlocal res, exception_msg
-        try:
-            with torch.inference_mode():
-                res = model.infer(
-                    tokenizer,
-                    prompt=prompt,
-                    image_file=str(image_path),
-                    output_path=str(image_path.parent),
-                    save_results=True,  # Always save results as per official example
-                    **config_for_infer,
-                )
-        except Exception as exc:
-            exception_msg = f"{type(exc).__name__}: {exc}"
-            logger.error("Inference exception in worker: %s", exception_msg)
-
-    # Start inference in a separate thread with timeout
-    logger.debug("Starting model.infer() with %ds timeout (test_all_modes)", timeout_seconds)
-    worker_thread = threading.Thread(target=_inference_worker, daemon=False)
-    worker_thread.start()
-    worker_thread.join(timeout=timeout_seconds)
-
-    if worker_thread.is_alive():
-        timeout_occurred = True
-        exception_msg = f"TimeoutException: Inference exceeded {timeout_seconds}s limit"
-        logger.error("Inference TIMEOUT after %ds (thread still running)", timeout_seconds)
-        time.sleep(0.5)
-
-    infer_time = time.time() - t0
-
-    # Process result: trust res as single source of truth
-    result_text = ""
-    if timeout_occurred:
-        logger.error("Inference timed out after %ds", timeout_seconds)
-        result_text = f"[INFERENCE_TIMEOUT] Exceeded {timeout_seconds}s limit"
-    elif exception_msg:
-        logger.error("Inference failed: %s", exception_msg)
-        result_text = f"[INFERENCE_EXCEPTION] {exception_msg}"
-    elif res is None:
-        logger.warning("Inference returned None (no result)")
-        result_text = ""
-    elif isinstance(res, str):
-        result_text = res.strip()
-        logger.debug("Inference returned string: %d chars", len(result_text))
-    elif isinstance(res, dict):
-        # If model returns a dict, try to extract text from common keys
-        result_text = res.get("text", res.get("response", res.get("output", "")))
-        if not result_text:
-            logger.warning("Inference returned dict but no text found in common keys: %s", list(res.keys()))
-        else:
-            logger.debug("Inference returned dict with text: %d chars", len(result_text))
-    else:
-        logger.warning("Inference returned unexpected type: %s", type(res).__name__)
-        result_text = str(res) if res else ""
-
-    # Save raw output to debug file if requested
-    if debug_save_path and result_text:
-        try:
-            debug_save_path.write_text(result_text, encoding="utf-8")
-            logger.debug("Saved raw output to %s", debug_save_path)
-        except Exception as e:
-            logger.warning("Could not save raw output: %s", e)
-
-    return result_text, infer_time
-
-
-def _run_ollama_inference(
-        image_path: Path,
-        logger: logging.Logger,
-        prompt: str,
-        model_name: str = "deepseek-ocr",
-) -> Tuple[str, float]:
-    """Run inference via Ollama HTTP API with an image."""
-    t0 = time.time()
-    try:
-        img_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-
-        payload = {"model": model_name, "prompt": prompt, "images": [img_b64], "stream": False}
-        data = json.dumps(payload).encode("utf-8")
-
-        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        req = urllib.request.Request(
-            url=f"{host}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            resp_data = resp.read().decode("utf-8")
-            try:
-                obj = json.loads(resp_data)
-                captured = obj.get("response", "")
-            except Exception:
-                captured = resp_data
-
-        infer_time = time.time() - t0
-        return str(captured).strip(), infer_time
-
-    except urllib.error.HTTPError as exc:
-        infer_time = time.time() - t0
-        logger.error("Ollama HTTP error %s: %s", exc.code, exc.reason)
-        return "", infer_time
-    except urllib.error.URLError as exc:
-        infer_time = time.time() - t0
-        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        logger.error("Ollama not reachable at %s: %s", host, exc.reason)
-        logger.error("Ensure 'ollama serve' is running and port 11434 is free.")
-        return "", infer_time
-    except Exception as exc:
-        infer_time = time.time() - t0
-        logger.error("Ollama inference failed: %s: %s", type(exc).__name__, exc)
-        return "", infer_time
 
 
 def run_page_ocr(
@@ -1586,344 +1285,50 @@ def run_page_ocr(
         infer_config: Dict[str, Any],
         logger: logging.Logger,
         page_id: str = "",
-        disable_fallbacks: bool = False,
-        backend: Backend = Backend.HUGGINGFACE,
-        test_all_modes: bool = False,
-        page_dir: Optional[Path] = None,
         store_raw: bool = False,
 ) -> Tuple[Dict[str, Any], float, str, List[int]]:
     """Run OCR on a single rendered page image.
 
+    Single-pass inference only: crop_mode fallback has been removed.
+
     Args:
-        test_all_modes: If True, run all INFERENCE_MODES on this page and log timing.
-        page_dir: Output directory for the page (used for saving mode outputs in test_all_modes)
         store_raw: If True, store raw detection metadata for debugging
 
     Returns:
         (page_ocr, inference_time_sec, attempt_used, resolution)
     """
-    if test_all_modes and backend == Backend.HUGGINGFACE:
-        return _run_all_modes_experiment(model, tokenizer, image_path, logger, page_id, page_dir)
 
-    if backend == Backend.OLLAMA:
-        logger.info("[%s] Inference (ollama)", page_id)
-        prompt = infer_config.get("prompt", DEFAULT_PROMPT_EXTRACT_ALL)
-        captured, infer_time = _run_ollama_inference(image_path, logger, prompt=prompt)
-        if _has_grounding_tags(captured):
-            page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
-                                                            store_raw=store_raw)
-            return page_ocr, infer_time, "ollama", resolution
-        logger.warning("[%s] No grounding tags detected", page_id)
-        img = Image.open(image_path).convert("RGB")
-        resolution = [img.size[0], img.size[1]]
-        return {"ocr": {"blocks": []}}, infer_time, "none", resolution
+    logger.info("[%s] Inference", page_id)
+    captured, infer_time = _run_inference(model, tokenizer, image_path, infer_config)
 
-    logger.info("[%s] Inference (base)", page_id)
-    debug_path = page_dir / f"{page_id.replace('|', '_')}_raw_base.txt" if (page_dir and store_raw) else None
-    captured, time_base = _run_inference(model, tokenizer, image_path, infer_config, debug_save_path=debug_path)
-
-    logger.debug("[%s] Base attempt captured %d chars", page_id, len(captured))
+    logger.debug("[%s] Attempt captured %d chars", page_id, len(captured))
     if captured:
         preview = captured[:200] if len(captured) > 200 else captured
-        logger.debug("[%s] Base output preview: %r", page_id, preview)
+        logger.debug("[%s] Output preview: %r", page_id, preview)
     else:
-        logger.warning("[%s] Base attempt produced empty output", page_id)
+        logger.warning("[%s] Inference produced empty output", page_id)
 
     if _has_grounding_tags(captured):
-        logger.info("[%s] Inference succeeded (base)", page_id)
-        page_ocr, _, resolution = parse_grounded_stdout(captured, image_path, logger, page_id=page_id,
-                                                        store_raw=store_raw)
+        logger.info("[%s] Inference succeeded", page_id)
+        page_ocr, _, resolution = parse_grounded_stdout(
+            captured,
+            image_path,
+            logger,
+            page_id=page_id,
+            store_raw=store_raw,
+        )
+        return page_ocr, infer_time, "base", resolution
 
-        # Save raw output to debug folder if --raw is enabled
-        if store_raw and page_dir:
-            try:
-                raw_output_path = page_dir / f"{page_id.replace('|', '_')}_raw_base.txt"
-                raw_output_path.write_text(captured, encoding='utf-8')
-                logger.debug("[%s] Raw output saved to: %s", page_id, raw_output_path.name)
-            except Exception as exc:
-                logger.warning("[%s] Failed to save raw output: %s", page_id, exc)
-
-        return page_ocr, time_base, "base", resolution
-
-    if not disable_fallbacks:
-        logger.info("[%s] Inference (crop_mode fallback)", page_id)
-        crop_config = dict(infer_config)
-        crop_config["crop_mode"] = True
-        debug_path_crop = page_dir / f"{page_id.replace('|', '_')}_raw_crop.txt" if (page_dir and store_raw) else None
-        captured_crop, time_crop = _run_inference(model, tokenizer, image_path, crop_config,
-                                                  debug_save_path=debug_path_crop)
-
-        logger.debug("[%s] Crop attempt captured %d chars", page_id, len(captured_crop))
-        if captured_crop:
-            preview_crop = captured_crop[:200] if len(captured_crop) > 200 else captured_crop
-            logger.debug("[%s] Crop output preview: %r", page_id, preview_crop)
-        else:
-            logger.warning("[%s] Crop attempt produced empty output", page_id)
-
-        if _has_grounding_tags(captured_crop):
-            logger.warning("[%s] Base attempt failed; crop_mode fallback succeeded", page_id)
-            page_ocr, _, resolution = parse_grounded_stdout(captured_crop, image_path, logger, page_id=page_id,
-                                                            store_raw=store_raw)
-
-            # Save raw crop output to debug folder if --raw is enabled
-            if store_raw and page_dir:
-                try:
-                    raw_output_path = page_dir / f"{page_id.replace('|', '_')}_raw_crop.txt"
-                    raw_output_path.write_text(captured_crop, encoding='utf-8')
-                    logger.debug("[%s] Raw crop output saved to: %s", page_id, raw_output_path.name)
-                except Exception as exc:
-                    logger.warning("[%s] Failed to save raw crop output: %s", page_id, exc)
-
-            return page_ocr, time_base + time_crop, "crop_mode", resolution
-
-        total_time = time_base + time_crop
-        logger.warning("[%s] No grounding tags detected after all attempts", page_id)
-        img = Image.open(image_path).convert("RGB")
-        resolution = [img.size[0], img.size[1]]
-        return {"ocr": {"blocks": []}}, total_time, "none", resolution
-
-    logger.warning("[%s] Base attempt failed; fallbacks disabled", page_id)
-    img = Image.open(image_path).convert("RGB")
+    logger.warning("[%s] No grounding tags detected", page_id)
+    img = Image.open(image_path)
+    if image_path.suffix.lower() == ".png" and image_path.name.startswith("page_") and img.mode != "RGB":
+        img = img.convert("RGB")
     resolution = [img.size[0], img.size[1]]
-    return {"ocr": {"blocks": []}}, time_base, "none", resolution
+    return {"ocr": {"blocks": []}}, infer_time, "none", resolution
 
 
-def _run_all_modes_experiment(
-        model: Any,
-        tokenizer: Any,
-        image_path: Path,
-        logger: logging.Logger,
-        page_id: str,
-        page_dir: Optional[Path] = None,
-) -> Tuple[Dict[str, Any], float, str, List[int]]:
-    """Run all inference modes on a page and log timing results.
-
-    Returns the result from the first successful mode.
-    """
-    logger.info("[%s] === RUNNING ALL MODES EXPERIMENT ===", page_id)
-    logger.info("[%s] Image path: %s", page_id, image_path)
-
-    img = Image.open(image_path).convert("RGB")
-    resolution = [img.size[0], img.size[1]]
-    logger.info("[%s] Image resolution: %dx%d", page_id, resolution[0], resolution[1])
-
-    # Create output directory for raw outputs
-    # Use persistent directory under page_dir if provided
-    if page_dir is not None:
-        mode_out_dir = page_dir / "mode_outputs"
-    else:
-        mode_out_dir = image_path.parent / f"{page_id.replace('|', '_')}_mode_outputs"
-
-    mode_out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Log CWD to make debugging easier
-    logger.info("[%s] CWD=%s", page_id, os.getcwd())
-    logger.info("[%s] Raw outputs will be saved to: %s", page_id, str(mode_out_dir.resolve()))
-
-    results = []
-    first_success = None
-    total_time = 0.0
-
-    for idx, (mode_name, mode_config) in enumerate(INFERENCE_MODES.items(), 1):
-        logger.info("[%s] " + "=" * 60, page_id)
-        logger.info("[%s] Testing mode %d/%d: %s", page_id, idx, len(INFERENCE_MODES), mode_name)
-        logger.debug("[%s]   base_size: %d", page_id, mode_config.get("base_size", 1024))
-        logger.debug("[%s]   image_size: %d", page_id, mode_config.get("image_size", 640))
-        logger.debug("[%s]   crop_mode: %s", page_id, mode_config.get("crop_mode", False))
-        prompt_text = mode_config.get("prompt", "")
-        if len(prompt_text) > 100:
-            logger.debug("[%s]   prompt: %s...", page_id, prompt_text[:100])
-        else:
-            logger.debug("[%s]   prompt: %s", page_id, prompt_text)
-
-        test_config = dict(mode_config)
-
-        try:
-            logger.debug("[%s] Starting inference for mode: %s", page_id, mode_name)
-            t_start = time.time()
-            captured, infer_time = _run_inference_with_timeout(model, tokenizer, image_path, test_config, timeout_seconds=180)
-            t_end = time.time()
-            total_time += infer_time
-
-            logger.debug("[%s] Inference completed in %.2fs (wall time: %.2fs)", page_id, infer_time, t_end - t_start)
-
-            success = _has_grounding_tags(captured)
-            char_count = len(captured)
-
-            # Count grounding tags
-            ref_count = captured.count("<|ref|>") if captured else 0
-            det_count = captured.count("<|det|>") if captured else 0
-
-            logger.debug("[%s] Output length: %d chars", page_id, char_count)
-            logger.debug("[%s] Grounding tags found: <|ref|>=%d, <|det|>=%d", page_id, ref_count, det_count)
-
-            # Save raw output
-            raw_output_file = mode_out_dir / f"{mode_name}.txt"
-            raw_output_file.write_text(captured if captured else "[EMPTY OUTPUT]", encoding="utf-8")
-            logger.debug("[%s] Raw output saved to: %s", page_id, raw_output_file.name)
-
-            # Parse and save bbox image for successful modes
-            mode_blocks = []
-            if success:
-                try:
-                    parsed_ocr, _, _ = parse_grounded_stdout(captured, image_path, logger, page_id=page_id)
-                    mode_blocks = parsed_ocr.get("ocr", {}).get("blocks", [])
-
-                    # Save bbox image for this mode
-                    bbox_img_path = mode_out_dir / f"{mode_name}_bbox.png"
-                    save_bbox_image(image_path, mode_blocks, bbox_img_path)
-                    logger.debug("[%s] Bbox image saved for mode %s: %d blocks", page_id, mode_name, len(mode_blocks))
-                except Exception as bbox_exc:
-                    logger.warning("[%s] Failed to save bbox for mode %s: %s", page_id, mode_name, bbox_exc)
-
-            # Save parsed JSON result
-            mode_result = {
-                "mode": mode_name,
-                "success": success,
-                "char_count": char_count,
-                "ref_tag_count": ref_count,
-                "det_tag_count": det_count,
-                "block_count": len(mode_blocks),
-            }
-            json_output_file = mode_out_dir / f"{mode_name}.json"
-            json_output_file.write_text(
-                json.dumps(mode_result, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-
-            result_entry = {
-                "mode": mode_name,
-                "time_sec": round(infer_time, 2),
-                "success": success,
-                "char_count": char_count,
-                "ref_tag_count": ref_count,
-                "det_tag_count": det_count,
-                "block_count": len(mode_blocks),
-                "base_size": mode_config.get("base_size", 1024),
-                "image_size": mode_config.get("image_size", 640),
-                "prompt": mode_config.get("prompt", ""),
-                "raw_output_file": str(raw_output_file.name),
-                "bbox_image": f"{mode_name}_bbox.png" if success else None,
-            }
-            results.append(result_entry)
-
-            status = "✓ SUCCESS" if success else "✗ FAILED"
-            if success:
-                logger.info("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d | blocks=%d",
-                            page_id, mode_name.ljust(30), status, infer_time, char_count, ref_tag_count, len(mode_blocks))
-            else:
-                logger.warning("[%s] %s | %s | time=%.1fs | chars=%d | tags=%d",
-                               page_id, mode_name.ljust(30), status, infer_time, char_count, ref_tag_count)
-
-            if success and first_success is None:
-                logger.info("[%s] First successful mode: %s", page_id, mode_name)
-                page_ocr_dict = {"ocr": {"blocks": mode_blocks}}
-                first_success = (page_ocr_dict, result_entry["mode"])
-
-        except Exception as exc:
-            logger.error("[%s] Mode %s exception: %s: %s", page_id, mode_name, type(exc).__name__, exc)
-            import traceback
-            logger.debug("[%s] Traceback:\n%s", page_id, traceback.format_exc())
-            results.append({
-                "mode": mode_name,
-                "time_sec": 0.0,
-                "success": False,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            })
-
-    # Log summary
-    logger.info("[%s] " + "=" * 60, page_id)
-    logger.info("[%s] === EXPERIMENT SUMMARY ===", page_id)
-    logger.info("[%s] Total modes tested: %d", page_id, len(results))
-    logger.info("[%s] Total time: %.1fs (%.1f min)", page_id, total_time, total_time / 60)
-
-    successful = [r for r in results if r.get("success", False)]
-    failed = [r for r in results if not r.get("success", False)]
-
-    if successful:
-        logger.info("[%s] Successful modes: %d / %d", page_id, len(successful), len(results))
-        fastest = min(successful, key=lambda x: x["time_sec"])
-        slowest = max(successful, key=lambda x: x["time_sec"])
-        logger.info("[%s] Fastest: %s (%.1fs)", page_id, fastest["mode"], fastest["time_sec"])
-        logger.info("[%s] Slowest: %s (%.1fs)", page_id, slowest["mode"], slowest["time_sec"])
-        logger.info("[%s] Speed ratio: %.1fx", page_id, slowest["time_sec"] / fastest["time_sec"])
-    else:
-        logger.warning("[%s] No modes succeeded! All %d modes failed.", page_id, len(failed))
-
-    if failed:
-        logger.warning("[%s] Failed modes: %d", page_id, len(failed))
-        for r in failed:
-            if "error" in r:
-                logger.debug("[%s]   - %s: %s", page_id, r["mode"], r.get("error", "unknown"))
-
-    # Save results to JSON (in mode_out_dir)
-    results_file = mode_out_dir / "mode_comparison.json"
-    results_file.write_text(json.dumps({
-        "page_id": page_id,
-        "image_path": str(image_path),
-        "resolution": resolution,
-        "total_time_sec": round(total_time, 2),
-        "successful_count": len(successful),
-        "failed_count": len(failed),
-        "results": results,
-    }, indent=2), encoding="utf-8")
-    logger.info("[%s] Mode comparison JSON saved to: %s", page_id, str(results_file.resolve()))
-    logger.info("[%s] " + "=" * 60, page_id)
-
-    if first_success:
-        page_ocr, mode_used = first_success
-        return page_ocr, total_time, f"experiment_{mode_used}", resolution
-    else:
-        return {"ocr": {"blocks": []}}, total_time, "experiment_none", resolution
 
 
-def save_bbox_image(page_img_path: Path, blocks: List[Dict[str, Any]], dest_path: Path) -> None:
-    """Draw bounding boxes on page image and save."""
-    from PIL import ImageDraw
-
-    img = Image.open(page_img_path).convert("RGB")
-    img_w, img_h = img.size
-    draw = ImageDraw.Draw(img)
-
-    for blk in blocks:
-        bbox = blk.get("bbox")
-        if not (isinstance(bbox, list) and len(bbox) == 4):
-            continue
-
-        norm_x1, norm_y1, norm_x2, norm_y2 = bbox
-
-        # Calculate corners with rounding (not truncation) for accuracy
-        x1 = int(round(norm_x1 * img_w))
-        y1 = int(round(norm_y1 * img_h))
-        x2 = int(round(norm_x2 * img_w))
-        y2 = int(round(norm_y2 * img_h))
-
-        # Clamp to image bounds to prevent out-of-bounds drawing
-        x1 = max(0, min(img_w - 1, x1))
-        y1 = max(0, min(img_h - 1, y1))
-        x2 = max(0, min(img_w, x2))
-        y2 = max(0, min(img_h, y2))
-
-        # Ensure at least 1 pixel wide/tall (prevents zero-size boxes)
-        if x2 <= x1:
-            x2 = min(img_w, x1 + 1)
-        if y2 <= y1:
-            y2 = min(img_h, y1 + 1)
-
-        # Draw rectangle (skip if still invalid)
-        try:
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        except Exception:
-            pass
-
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(dest_path)
-
-
-def _copy_image(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    Image.open(src).convert("RGB").save(dst)
 
 
 def process_document(
@@ -1936,9 +1341,7 @@ def process_document(
         logger: logging.Logger,
         pages: Optional[List[int]] = None,
         page_range: Optional[str] = None,
-        backend: Backend = Backend.HUGGINGFACE,
         inference_config: Optional[Dict[str, Any]] = None,
-        legacy_document_json: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Process one input document and write per-page outputs.
 
@@ -1955,12 +1358,6 @@ def process_document(
         selection_dir = output_root
     selection_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create separate debug directory for artifacts
-    debug_dir = None
-    if cfg.debug_keep_renders or cfg.save_bbox_overlay or cfg.store_raw_metadata:
-        debug_dir = selection_dir / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
     infer_config = inference_config if inference_config is not None else INFERENCE_CONFIG
 
     with tempfile.TemporaryDirectory() as tmpdir_str:
@@ -1973,23 +1370,20 @@ def process_document(
 
             selected_indices = parse_page_selection(pages, page_range, total_pages)
 
-            # Create debug directory for transformation images if debug is enabled
-            debug_transforms_dir = None
-            if cfg.debug_keep_renders:
-                debug_transforms_dir = debug_dir / "transforms" if debug_dir else selection_dir / "debug" / "transforms"
-                debug_transforms_dir.mkdir(parents=True, exist_ok=True)
-                logger.info("Debug mode: Saving intermediate transformation images to %s", debug_transforms_dir)
-
             page_image_paths = render_pdf_to_images(
-                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices,
-                debug_save_dir=debug_transforms_dir, disable_downscale=cfg.disable_downscale
+                input_path, cfg.dpi, tmp_dir, logger, page_indices=selected_indices
             )
         else:
             # For direct image input, apply rotation detection if enabled
-            img = Image.open(input_path).convert("RGB")
+            img = Image.open(input_path)
             detected_rotation = detect_page_rotation(img, logger)
 
             if detected_rotation > 0:
+                # If we rotate, we need an RGB-like image for saving/consistency.
+                # Only convert if required by the underlying mode.
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
+
                 logger.info(
                     "[IMAGE] Rotation correction: detected=%d° → rotating image",
                     detected_rotation
@@ -2023,12 +1417,6 @@ def process_document(
             # OmniDocBench format: no per-page subdirectories
             page_id = f"{input_path.stem}|P{page_index:04d}"
 
-            if cfg.debug_keep_renders and debug_dir:
-                try:
-                    _copy_image(page_path, debug_dir / f"page_{page_index:04d}_render.png")
-                except Exception as exc:
-                    logger.warning("[%s] failed to persist render.png: %s: %s", page_id, type(exc).__name__, exc)
-
             try:
                 page_ocr, infer_time, attempt_used, resolution = run_page_ocr(
                     model=model,
@@ -2037,19 +1425,9 @@ def process_document(
                     infer_config=infer_config,
                     logger=logger,
                     page_id=page_id,
-                    disable_fallbacks=cfg.disable_fallbacks,
-                    backend=cfg.backend,
-                    test_all_modes=cfg.test_all_modes,
-                    page_dir=debug_dir,  # Pass debug_dir for any page-specific debug files
                     store_raw=cfg.store_raw_metadata,
                 )
 
-                if cfg.save_bbox_overlay and debug_dir:
-                    try:
-                        save_bbox_image(page_path, page_ocr.get("ocr", {}).get("blocks", []),
-                                        debug_dir / f"page_{page_index:04d}_bbox.png")
-                    except Exception as exc:
-                        logger.warning("[%s] failed to save bbox overlay: %s: %s", page_id, type(exc).__name__, exc)
 
                 document_id = input_path.stem
                 page_id_str = str(page_index)
@@ -2085,8 +1463,6 @@ def process_document(
                 page_warnings: List[str] = []
                 if attempt_used == "none":
                     page_warnings.append("OCR extraction failed - no grounding tags detected")
-                elif attempt_used == "crop_mode":
-                    page_warnings.append("Base attempt failed, used crop_mode fallback")
 
                 if len(spec_blocks) == 0 and attempt_used != "none":
                     page_warnings.append("No blocks extracted from page")
@@ -2126,7 +1502,8 @@ def process_document(
                 logger.error("[%s] page failed: %s: %s", page_id, type(exc).__name__, exc)
 
                 try:
-                    img = Image.open(page_path).convert("RGB")
+                    img = Image.open(page_path)
+                    # Keep raw mode for direct-image inputs; PDF inputs already recorded via render path.
                     resolution = [img.size[0], img.size[1]]
                 except Exception:
                     resolution = [0, 0]
@@ -2201,10 +1578,7 @@ def process_document(
         "metrics_summary": summary,
     }
 
-    if legacy_document_json:
-        out_path = selection_dir / "document.json"
-        out_path.write_text(json.dumps(doc_json, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("Legacy document.json written to %s", out_path)
+    # Legacy document.json is no longer written - only per-page spec files
 
     return doc_json, summary
 
@@ -2252,67 +1626,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="./out_json/deepseek_ocr", help="Output directory for JSON files")
     parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
     parser.add_argument("--device", default="cuda", choices=["auto", "cuda", "mps", "cpu"], help="Device selection")
-    parser.add_argument("--revision", default=None, help="Optional model revision")
     parser.add_argument("--pages", type=int, nargs="+", help="Page indices to process (1-based, e.g., 1 5 10)")
     parser.add_argument("--page-range", type=str, help="Inclusive page range (1-based, e.g., 1-10)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Console log level")
-    parser.add_argument("--keep-renders", action="store_true",
-                        help="Persist rendered page images under page folders (recommended)")
-    parser.add_argument(
-        "--no-bbox-overlay",
-        action="store_true",
-        default=False,
-        help="Disable bounding box overlay images (enabled by default)",
-    )
-    parser.add_argument(
-        "--enable-fallbacks",
-        action="store_true",
-        help="Enable crop_mode fallback when base attempt fails (may cause CUDA errors)",
-    )
-    parser.add_argument(
-        "--disable-fallbacks",
-        action="store_true",
-        help="[DEPRECATED] Use --enable-fallbacks instead. Fallbacks are now disabled by default.",
-    )
-    parser.add_argument("--backend", default="huggingface", choices=[b.value for b in Backend],
-                        help="Backend: huggingface or ollama")
-    parser.add_argument(
-        "--mode",
-        default=None,
-        choices=list(INFERENCE_MODES.keys()) + [None],
-        help="Inference mode with optimized settings (default: uses INFERENCE_CONFIG)",
-    )
-    parser.add_argument(
-        "--prompt",
-        default=None,
-        help="Custom prompt to override mode default (e.g., '<image>\\n<|grounding|>Extract all text.')",
-    )
-    parser.add_argument("--test-compress", action="store_true",
-                        help="Enable test_compress mode for compression diagnostics")
     parser.add_argument("--base-size", type=int, default=None, help="Override base_size (e.g., 512, 768, 1024, 1280)")
     parser.add_argument("--image-size", type=int, default=None,
                         help="Override image_size (e.g., 384, 512, 640, 768, 896)")
     parser.add_argument("--max-new-tokens", type=int, default=None,
                         help="Maximum tokens to generate (default: model default)")
-    parser.add_argument(
-        "--legacy-document-json",
-        action="store_true",
-        default=False,
-        help="Write legacy document.json in addition to per-page spec files (default: OFF)",
-    )
-    parser.add_argument(
-        "--test-all-modes",
-        action="store_true",
-        default=False,
-        help="Run all inference modes on each page with 3-minute timeout per mode (for debugging slowdowns)",
-    )
-    parser.add_argument(
-        "--disable-downscale",
-        action="store_true",
-        default=True,
-        help="Disable MAX_IMAGE_DIMENSION downscaling (keeps full resolution, now default behavior)",
-    )
     parser.add_argument(
         "--raw",
         action="store_true",
@@ -2345,25 +1667,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     logger = _setup_logger(args.log_level)
 
-    backend = Backend(args.backend)
-    if backend == Backend.HUGGINGFACE:
-        _, resolved_device = resolve_device(args.device, logger)
-    else:
-        resolved_device = "cpu"
+    _, resolved_device = resolve_device(args.device, logger)
 
     cfg = Config(
-        backend=backend,
         dpi=args.dpi,
         out_dir=args.output_dir,
         log_level=args.log_level,
-        debug_keep_renders=bool(args.keep_renders),
-        save_bbox_overlay=not args.no_bbox_overlay,
-        disable_fallbacks=not args.enable_fallbacks if not args.disable_fallbacks else args.disable_fallbacks,
-        test_all_modes=args.test_all_modes,
-        disable_downscale=args.disable_downscale,
         store_raw_metadata=args.raw,
     )
-    ds_cfg = DeepSeekConfig(device=resolved_device, revision=args.revision)
+    ds_cfg = DeepSeekConfig(device=resolved_device)
 
     input_path = Path(args.input).expanduser().resolve()
     try:
@@ -2375,27 +1687,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("No valid PDF or image files found")
         return 2
 
-    model, tokenizer = build_model(cfg.model, resolved_device, ds_cfg.revision, logger, backend=backend)
+    model, tokenizer = build_model(cfg.model, resolved_device, logger)
 
     # Start with INFERENCE_CONFIG as the base default
     inference_config = INFERENCE_CONFIG.copy()
 
-    # Merge mode-specific settings if a mode is specified
-    if args.mode and args.mode in INFERENCE_MODES:
-        mode_config = INFERENCE_MODES[args.mode]
-        inference_config.update(mode_config)
-        logger.info("Mode: %s (merging mode-specific settings)", args.mode)
-
-    if args.prompt is not None:
-        inference_config["prompt"] = args.prompt
-        logger.info("Prompt: custom (--prompt)")
-    else:
-        prompt_source = f"mode default ({args.mode})" if args.mode in INFERENCE_MODES else "default"
-        logger.info("Prompt: %s", prompt_source)
-
-    if args.test_compress:
-        inference_config["test_compress"] = True
-        logger.info("test_compress enabled")
 
     if args.base_size:
         inference_config["base_size"] = args.base_size
@@ -2407,22 +1703,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         inference_config["max_new_tokens"] = args.max_new_tokens
         logger.info("max_new_tokens set to %d", args.max_new_tokens)
 
-    if cfg.disable_fallbacks:
-        logger.info("Crop mode fallback: disabled")
-    else:
-        logger.info("Crop mode fallback: enabled")
 
     logger.info(
-        "Mode: %s (base_size=%s, image_size=%s)",
-        args.mode,
+        "Config: base_size=%s, image_size=%s",
         inference_config.get("base_size"),
         inference_config.get("image_size"),
     )
-
-    if args.legacy_document_json:
-        logger.info("Legacy document.json output: enabled")
-    else:
-        logger.info("Legacy document.json output: disabled")
 
     out_dir = Path(cfg.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2456,11 +1742,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             pages=args.pages,
             page_range=args.page_range,
             inference_config=inference_config,
-            legacy_document_json=args.legacy_document_json,
         )
 
         selection_dir = doc_root / selection_label
-        out_path = selection_dir / "document.json" if args.legacy_document_json else selection_dir
+        out_path = selection_dir
 
         run_items.append(
             {
