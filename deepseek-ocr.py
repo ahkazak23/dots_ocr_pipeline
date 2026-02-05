@@ -1187,6 +1187,45 @@ def _has_grounding_tags(text: str) -> bool:
     return bool(text and "<|ref|>" in text and "<|det|>" in text)
 
 
+def _clean_model_debug_output(text: str) -> str:
+    """Remove model debug statistics from captured output.
+
+    The model prints debug info like:
+    ==================================================
+    image size:  (1653, 2339)
+    valid image tokens:  780
+    output texts tokens (valid):  2785
+    compression ratio:  3.57
+    ==================================================
+
+    This should be removed from the OCR content.
+    """
+    if not text:
+        return text
+
+    # Find the last occurrence of === separator pattern
+    # The debug output is typically at the end after the last grounding tag
+    lines = text.split('\n')
+
+    # Find last line with === (at least 20 = signs)
+    last_separator_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if '=' * 20 in lines[i]:
+            last_separator_idx = i
+            break
+
+    # If we found a separator, check if there's another one before it (debug block pattern)
+    if last_separator_idx > 0:
+        # Look backward for the opening separator
+        for i in range(last_separator_idx - 1, -1, -1):
+            if '=' * 20 in lines[i]:
+                # Found the opening separator - remove everything from here to end
+                cleaned_lines = lines[:i]
+                return '\n'.join(cleaned_lines).strip()
+
+    return text
+
+
 def _run_inference(
         model: Any,
         tokenizer: Any,
@@ -1257,7 +1296,7 @@ def _run_inference(
                 prompt=prompt,
                 image_file=str(image_path),
                 output_path=inference_output_path,
-                save_results=False,
+                save_results=True,
                 **config_for_infer,
             )
     except Exception as exc:
@@ -1279,22 +1318,32 @@ def _run_inference(
     captured = ""
     if out_buf.getvalue().strip():
         captured = out_buf.getvalue().strip()
-        logger.debug("Captured from stdout: %d chars", len(captured))
+        logger.debug("Captured from stdout: %d chars (raw)", len(captured))
     elif err_buf.getvalue().strip():
         captured = err_buf.getvalue().strip()
-        logger.debug("Captured from stderr: %d chars", len(captured))
+        logger.debug("Captured from stderr: %d chars (raw)", len(captured))
     else:
         logger.warning("No output captured from buffers")
         if exception_msg:
             captured = f"[INFERENCE_EXCEPTION] {exception_msg}"
 
-    # Save to debug file if requested
-    if debug_dir and captured:
+    # Clean model debug output (statistics) from captured text
+    if captured and not captured.startswith("[INFERENCE_EXCEPTION]"):
+        captured_cleaned = _clean_model_debug_output(captured)
+        if len(captured_cleaned) < len(captured):
+            logger.debug("Removed %d chars of model debug output", len(captured) - len(captured_cleaned))
+        captured = captured_cleaned
+
+    # Save to debug file if requested (save the raw uncleaned version for debugging)
+    if debug_dir:
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)
+            # Save raw uncleaned output
             raw_output_path = debug_dir / "raw_output.txt"
-            raw_output_path.write_text(captured, encoding="utf-8")
-            logger.debug("Saved raw output to: %s", raw_output_path)
+            raw_with_debug = out_buf.getvalue().strip() or err_buf.getvalue().strip() or ""
+            if raw_with_debug:
+                raw_output_path.write_text(raw_with_debug, encoding="utf-8")
+                logger.debug("Saved raw output (with debug stats) to: %s", raw_output_path)
         except Exception as e:
             logger.warning("Failed to save raw output: %s", e)
 
